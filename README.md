@@ -15,8 +15,10 @@
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/dancingamer/ComfyUI_LC_Vision_nodes
+git clone https://github.com/dancingamer/ComfyUI_LC_VisionNodes ComfyUI_LC_Vision_nodes
 ```
+
+> 이 포크의 저장소 이름은 `ComfyUI_LC_VisionNodes`지만, 위처럼 폴더 이름을 원본과 같은 `ComfyUI_LC_Vision_nodes`로 지정해 받으세요.
 
 ### 원본을 이미 설치한 PC
 
@@ -25,7 +27,7 @@ git clone https://github.com/dancingamer/ComfyUI_LC_Vision_nodes
 ```bash
 cd ComfyUI/custom_nodes/ComfyUI_LC_Vision_nodes
 git remote rename origin upstream
-git remote add origin https://github.com/dancingamer/ComfyUI_LC_Vision_nodes
+git remote add origin https://github.com/dancingamer/ComfyUI_LC_VisionNodes
 git fetch origin
 git checkout main
 git reset --hard origin/main
