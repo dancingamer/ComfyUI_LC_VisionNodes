@@ -1,3 +1,54 @@
+## 🇰🇷 이 저장소는 포크입니다
+
+원본 [lonecatone23/ComfyUI_LC_Vision_nodes](https://github.com/lonecatone23/ComfyUI_LC_Vision_nodes)에 아래 두 가지만 추가한 포크입니다. 그 외에는 원본과 같고, 원본 README는 이 안내 아래에 그대로 있습니다.
+
+### 무엇이 다른가
+
+- **긴 노트 번역이 중간에 실패하던 문제 수정** (`lc_vision_translate.py`)
+  - 링크 글자가 주소처럼 생긴 마크다운 링크(`[github.com/...](https://...)`)가 번역 중 깨지던 것을 고쳤습니다.
+  - 숫자 검증을 값 기준으로 바꿔 `1`과 `1.0`을 같은 것으로 봅니다. 또 숫자가 **빠진** 경우만 실패로 처리하므로, "one or two"를 "1개 또는 2개"로 옮겨도 통과합니다.
+  - 번역 로그를 볼 수 있는 `GET /lc_vision/translate/logs` 엔드포인트를 추가했습니다.
+- **노드 설명 한국어 번역 추가** (`locales/ko/nodeDefs.json`)
+  - ComfyUI 설정에서 언어를 한국어로 두면 노드 위 툴팁 설명이 한국어로 나옵니다. ComfyUI 표준 `locales` 방식이라 코어 파일은 건드리지 않습니다.
+
+### 처음 설치하는 PC
+
+```bash
+cd ComfyUI/custom_nodes
+git clone https://github.com/dancingamer/ComfyUI_LC_Vision_nodes
+```
+
+### 원본을 이미 설치한 PC
+
+폴더를 지우고 다시 받을 필요 없이, 받아오는 주소만 이 포크로 바꾸면 됩니다.
+
+```bash
+cd ComfyUI/custom_nodes/ComfyUI_LC_Vision_nodes
+git remote rename origin upstream
+git remote add origin https://github.com/dancingamer/ComfyUI_LC_Vision_nodes
+git fetch origin
+git checkout main
+git reset --hard origin/main
+```
+
+> `git reset --hard`는 이 폴더에서 직접 고친 내용을 전부 버립니다. 고친 게 있다면 먼저 `git stash`로 빼두세요.
+
+### 나중에 원본 업데이트 받기
+
+```bash
+git fetch upstream
+git merge upstream/main
+```
+
+위에서 `upstream`을 연결해 뒀으므로 원본의 새 버전을 계속 따라갈 수 있습니다. 위 두 파일에서 충돌이 나면 대부분 원본 쪽을 받은 뒤 이 포크의 수정을 다시 얹는 편이 빠릅니다.
+
+### 함께 필요한 것
+
+- 노트 번역은 이 팩의 GGUF 모델이 번역을 수행하고, 버튼은 [ComfyUI_LC123_nodes 포크](https://github.com/dancingamer/ComfyUI_LC123_nodes)의 LC Note에 있습니다. 번역 기능을 쓰려면 두 포크를 같이 받으세요.
+- **ComfyUI-EZi Desktop으로 실행한다면** `Add-Ons/Tools/Helper-CEI/ComfyUI-EZi.py`의 프록시 타임아웃을 `ClientTimeout(total=600)`으로 올려야 합니다. 기본 120초로는 긴 노트를 번역하는 도중 연결이 끊깁니다. 이 파일은 ComfyUI 밖에 있어서 저장소에 포함되지 않으니 PC마다 직접 고쳐야 합니다.
+
+---
+
 # ComfyUI LC Vision Nodes
 
 Custom nodes for [ComfyUI](https://github.com/comfyanonymous/ComfyUI) by [lonecatone23](https://github.com/lonecatone23).
