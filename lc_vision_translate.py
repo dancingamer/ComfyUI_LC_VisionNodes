@@ -19,14 +19,27 @@ from __future__ import annotations
 import gc
 import re
 import threading
+import time
 
 from .lc_vision_loader import _discover_vision_models, gguf_architecture, strip_thinking
 
 _LOCK = threading.Lock()
+
+# --- logging for MCP/debug ---
+_LOG_LINES: list[str] = []
+_LOG_MAX = 200
+
+def _log(msg: str):
+    """Print and store for /lc_vision/translate/logs."""
+    print(msg)
+    _LOG_LINES.append(f"{time.strftime('%H:%M:%S')} {msg}")
+    if len(_LOG_LINES) > _LOG_MAX:
+        del _LOG_LINES[: len(_LOG_LINES) - _LOG_MAX]
 _PH = "⟦{}⟧"  # ⟦0⟧
 _PROTECT = [
     re.compile(r"```.*?```", re.S),                     # fenced code
     re.compile(r"`[^`\n]+`"),                           # inline code
+    re.compile(r"\[[\w.-]+\.[a-z]{2,}[^\]\n]*\]\([^)\s]+\)"),  # link whose text is a url: keep both halves
     re.compile(r"(?<=\]\()[^)\s]+(?=\))"),              # link targets
     re.compile(r"https?://[^\s)>\]]+"),                 # bare urls
     re.compile(r"</?[A-Za-z][^>\n]*>"),                 # html tags
@@ -53,16 +66,107 @@ def _restore(text: str, saved: list[str]):
 
 
 _NUM = re.compile(r"(?<![A-Za-z_\d.])\d+(?:[.,]\d+)?(?!\d)")
+_HEADING = re.compile(r"^#{1,6}\s+\S")
+_RULE = re.compile(r"^(-{3,}|\*{3,}|_{3,})$")
+# Long notes lose links/numbers in one shot; cut around this size and translate piece by piece.
+_CHUNK_CHARS = 900
 
 
 def _numbers(text: str) -> list[str]:
-    return sorted(_NUM.findall(re.sub(r"⟦\d+⟧", " ", text)))
+    """Numbers by value: a translation may write 1 as 1.0 without changing the setting."""
+    out = []
+    for raw in _NUM.findall(re.sub(r"⟦\d+⟧", " ", text)):
+        try:
+            out.append(f"{float(raw):g}")
+        except ValueError:  # grouped like 1,000: compare as written
+            out.append(raw)
+    return sorted(out)
 
 
 def _clean(out: str) -> str:
     out = strip_thinking(out)
     m = re.match(r"^```(?:markdown|md)?\s*\n(.*)\n```\s*$", out, re.S)
     return m.group(1) if m else out
+
+
+def _sections(text: str) -> list[str]:
+    """Cut on heading / --- lines without breaking fenced code blocks."""
+    parts: list[str] = []
+    buf: list[str] = []
+    in_fence = False
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            buf.append(line)
+            continue
+        if not in_fence and buf and (_HEADING.match(stripped) or _RULE.match(stripped)):
+            parts.append("".join(buf))
+            buf = []
+        buf.append(line)
+    if buf:
+        parts.append("".join(buf))
+    return parts or [text]
+
+
+def _pack_chunks(sections: list[str], limit: int) -> list[str]:
+    chunks: list[str] = []
+    cur = ""
+    for s in sections:
+        if not cur:
+            cur = s
+        elif len(cur) + len(s) <= limit:
+            cur += s
+        else:
+            chunks.append(cur)
+            cur = s
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _table_header(lines: list[str]) -> list[str]:
+    """If this block starts as a markdown table, keep header + separator with every piece."""
+    if len(lines) >= 2 and "|" in lines[0] and re.match(r"^\s*\|?\s*:?-{3,}", lines[1]):
+        return lines[:2]
+    return []
+
+
+def _hard_split(text: str, limit: int) -> list[str]:
+    """Force-split any oversized block by lines (tables keep their header on each piece)."""
+    if len(text) <= limit:
+        return [text]
+    lines = text.splitlines(keepends=True)
+    header = _table_header([ln.rstrip("\r\n") for ln in lines[:3]])
+    header_txt = "".join(lines[: len(header)]) if header else ""
+    body = lines[len(header) :] if header else lines
+    chunks: list[str] = []
+    cur = header_txt
+    for line in body:
+        if cur and len(cur) + len(line) > limit:
+            chunks.append(cur)
+            cur = header_txt + line
+        else:
+            cur += line
+    if cur and cur != header_txt:
+        chunks.append(cur)
+    return chunks or [text]
+
+
+def _chunks_for(text: str, limit: int) -> list[str]:
+    packed = _pack_chunks(_sections(text), limit)
+    out: list[str] = []
+    for piece in packed:
+        out.extend(_hard_split(piece, limit))
+    return out or [text]
+
+
+def _is_table_heavy(text: str) -> bool:
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 4:
+        return False
+    pipes = sum(1 for ln in lines if ln.count("|") >= 2)
+    return pipes / len(lines) >= 0.5
 
 
 def _pick_model(requested: str | None):
@@ -80,9 +184,11 @@ def _pick_model(requested: str | None):
     return name, models[name][0]
 
 
-def _run(llm, system: str, text: str, target: str, name: str, what: str) -> str:
+def _run_one(llm, system: str, text: str, target: str, name: str, what: str) -> str:
     body, saved = _protect(text)
     want_nums = _numbers(body)
+    # big markdown tables are number-dense; exact number match rejects good translations
+    check_nums = not _is_table_heavy(text)
     for attempt, temp in enumerate((0.2, 0.05, 0.4)):
         r = llm.create_chat_completion(
             messages=[{"role": "system", "content": system}, {"role": "user", "content": body}],
@@ -95,13 +201,45 @@ def _run(llm, system: str, text: str, target: str, name: str, what: str) -> str:
         restored, missing = _restore(out, saved)
         # a marker the model invented (not one of ours) must never reach the note
         restored = re.sub(r"\s*⟦\d+⟧", "", restored).strip()
-        if out and not missing and _numbers(out) != want_nums:
+        if out and not missing and check_nums and _numbers(out) != want_nums:
             missing = ["numbers"]
         if out and not missing:
-            print(f"[LC Vision] translated note {what} to {target} with {name}")
+            _log(f"[LC Vision] translated note {what} to {target} with {name}")
             return restored
-        print(f"[LC Vision] {what} attempt {attempt + 1} lost links, code or numbers ({missing[:3]}), retrying")
+        _log(f"[LC Vision] {what} attempt {attempt + 1} lost links, code or numbers ({missing[:3]}), retrying")
     raise RuntimeError("The model kept changing links, code or numbers in the note. Try again, or shorten the note.")
+
+
+def _run(llm, system: str, text: str, target: str, name: str, what: str) -> tuple[str, int]:
+    """Returns (translated_text, failed_slice_count). failed_slice_count > 0 means some slices stayed original."""
+    if len(text) <= _CHUNK_CHARS:
+        return _run_one(llm, system, text, target, name, what), 0
+    chunks = _chunks_for(text, _CHUNK_CHARS)
+    if len(chunks) == 1:
+        return _run_one(llm, system, text, target, name, what), 0
+    _log(f"[LC Vision] {what}: splitting into {len(chunks)} chunks ({len(text)} chars)")
+    outs: list[str] = []
+    failed = 0
+    for i, chunk in enumerate(chunks, 1):
+        label = f"{what}[{i}/{len(chunks)}]"
+        _log(f"[LC Vision] {label}: {len(chunk)} chars")
+        try:
+            piece = _run_one(llm, system, chunk, target, name, label)
+        except Exception as e:
+            # one more try on the bad slice before leaving it in the original language
+            _log(f"[LC Vision] {label} failed ({e}); retrying slice once")
+            try:
+                piece = _run_one(llm, system, chunk, target, name, label + "-retry")
+            except Exception as e2:
+                failed += 1
+                _log(f"[LC Vision] {label} failed again ({e2}); keeping original for this slice")
+                piece = chunk
+        if outs and not outs[-1].endswith("\n") and piece and not piece.startswith("\n"):
+            outs.append("\n")
+        outs.append(piece)
+    if failed:
+        _log(f"[LC Vision] {what}: {failed}/{len(chunks)} slices kept original")
+    return "".join(outs), failed
 
 
 def _llm(requested_model):
@@ -146,11 +284,12 @@ def _spelling(text: str, requested_model: str | None, title: str | None = None):
         "anything. Output only the corrected Markdown." + (" /no_think" if qwen3 else "")
     )
     try:
-        out = _run(llm, system, text, "the same language", name, "spelling")
+        out, _failed = _run(llm, system, text, "the same language", name, "spelling")
         out_title = None
         if title and title.strip():
             try:
-                out_title = _run(llm, system, title.strip(), "the same language", name, "title spelling").splitlines()[0].strip() or None
+                title_out, _ = _run(llm, system, title.strip(), "the same language", name, "title spelling")
+                out_title = title_out.splitlines()[0].strip() or None
             except Exception:
                 out_title = None
         return out, out_title
@@ -194,14 +333,14 @@ def _write_note(workflow: str, requested_model: str | None):
         out = _tidy_note(_clean((r["choices"][0]["message"].get("content") or "").strip()))
         if not out:
             raise RuntimeError("The model returned nothing. Try again.")
-        print(f"[LC Vision] wrote a workflow note with {name}")
+        _log(f"[LC Vision] wrote a workflow note with {name}")
         return out
     finally:
         _free(llm)
 
 
 def _translate(text: str, target: str, requested_model: str | None, title: str | None = None):
-    """Returns (text, title). The title is best effort: None if it could not be translated."""
+    """Returns (text, title, failed_slice_count). Title is best effort (None if it could not be translated)."""
     from llama_cpp import Llama
 
     name, path = _pick_model(requested_model)
@@ -233,14 +372,15 @@ def _translate(text: str, target: str, requested_model: str | None, title: str |
     )
     llm = Llama(model_path=path, n_ctx=16384, n_gpu_layers=gpu, verbose=False)
     try:
-        out = _run(llm, system, text, target, name, "text")
+        out, failed = _run(llm, system, text, target, name, "text")
         out_title = None
         if title and title.strip():
             try:
-                out_title = _run(llm, title_system, title.strip(), target, name, "title").splitlines()[0].strip() or None
+                title_out, _ = _run(llm, title_system, title.strip(), target, name, "title")
+                out_title = title_out.splitlines()[0].strip() or None
             except Exception as e:
-                print(f"[LC Vision] title not translated ({e}); the note shows the original title twice")
-        return out, out_title
+                _log(f"[LC Vision] title not translated ({e}); the note shows the original title twice")
+        return out, out_title, failed
     finally:
         del llm
         gc.collect()
@@ -269,6 +409,18 @@ try:
         default = _pick_model(None)[0] if models else ""
         return web.json_response({"available": ok and bool(models), "models": models, "default": default})
 
+    @PromptServer.instance.routes.get("/lc_vision/translate/logs")
+    async def _logs(request):
+        """Return recent translation logs for debugging (MCP, etc.)."""
+        try:
+            n = int(request.query.get("n", 50))
+        except ValueError:
+            n = 50
+        n = max(1, min(n, _LOG_MAX))
+        lines = _LOG_LINES[-n:] if _LOG_LINES else []
+        busy = _LOCK.locked()
+        return web.json_response({"logs": lines, "busy": busy, "total": len(_LOG_LINES)})
+
     @PromptServer.instance.routes.post("/lc_vision/translate")
     async def _translate_route(request):
         import asyncio
@@ -278,16 +430,24 @@ try:
         if not text.strip() or not target:
             return web.json_response({"error": "Nothing to translate."}, status=400)
         if not _LOCK.acquire(blocking=False):
+            _log("[LC Vision] request refused: another translation is still running")
             return web.json_response({"error": "Another translation is still running."}, status=409)
+        _log(f"[LC Vision] request in: {len(text)} chars -> {target}")
+        started = time.monotonic()
         try:
             if data.get("task") == "spelling":
                 out, title = await asyncio.get_running_loop().run_in_executor(None, _spelling, text, data.get("model"), data.get("title"))
-            else:
-                out, title = await asyncio.get_running_loop().run_in_executor(
-                    None, _translate, text, target, data.get("model"), data.get("title")
-                )
-            return web.json_response({"text": out, "title": title})
+                return web.json_response({"text": out, "title": title, "partial": False})
+            out, title, failed = await asyncio.get_running_loop().run_in_executor(
+                None, _translate, text, target, data.get("model"), data.get("title")
+            )
+            _log(f"[LC Vision] replying with {len(out)} chars after {time.monotonic() - started:.0f}s")
+            return web.json_response({"text": out, "title": title, "partial": bool(failed), "failed_slices": failed})
+        except asyncio.CancelledError:
+            _log(f"[LC Vision] client dropped the connection after {time.monotonic() - started:.0f}s")
+            raise
         except Exception as e:
+            _log(f"[LC Vision] failed after {time.monotonic() - started:.0f}s: {e}")
             return web.json_response({"error": str(e)}, status=500)
         finally:
             _LOCK.release()
