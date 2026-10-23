@@ -1,0 +1,11 @@
+{
+  "LCVisionCaption": {
+    "description": "를 로드한 LC Vision 모델과 지시사항, 최대 세 개의 독립적인 참조 이미지 및 참조 비디오를 사용하여 텍스트를 생성합니다. 각각은 프롬프트에 명확히 레이블을 붙여서 하나의 배치로 병합하지 않고 분리됩니다."
+  },
+  "LCVisionLoader": {
+    "description": "Qwen-VL GGUF 모델 + mmproj 시각 프로젝터를 한 번만 로드합니다. ComfyUI 자체 노드 캐싱은 이러한 입력이 변경되지 않는 한 큐 간에 해당 모델을 계속 유지합니다."
+  },
+  "LCVisionPromptEnhancer": {
+    "description": "LC 비전 모델을 사용하여 프롬프트를 재작성합니다. 선택적 이미지가 있어야 수정 중인 내용을 보여줍니다(플럭스 3 편집 예제는 이미지를 필요로 합니다)."
+  }
+}
