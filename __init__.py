@@ -59,6 +59,8 @@ _load("lc_vision_assistant_models")
 _load("lc_vision_models_routes")
 _load("lc_vision_gated")
 _load("lc_vision_movie_routes")
+_load("lc_vision_boxes")
+_load("lc_vision_place")
 
 WEB_DIRECTORY = "./web"
 

@@ -22,7 +22,7 @@ import re
 import threading
 import time
 
-from .lc_vision_loader import _discover_vision_models, gguf_architecture, strip_thinking
+from .lc_vision_loader import _discover_vision_models, gguf_architecture, linux_cuda_plugin, llama_missing_hint, new_llama, strip_thinking
 
 IDLE_UNLOAD = 60  # seconds: the chat model gives its VRAM back a minute after the last answer
 _LOCK = threading.Lock()
@@ -280,8 +280,6 @@ def _load(requested):
         return _STATE["llm"]
     _free()
     _make_room(plan["need_gb"])
-    from llama_cpp import Llama
-
     try:
         import torch
 
@@ -289,7 +287,7 @@ def _load(requested):
     except Exception:
         gpu = 0
     print(f"[Vision Assistant] loading {name} for chat")
-    _STATE["llm"] = Llama(**_llama_kwargs(path, ctx, gpu if plan["mode"] == "gpu" else 0))
+    _STATE["llm"] = new_llama(**_llama_kwargs(path, ctx, gpu if plan["mode"] == "gpu" else 0))
     _STATE["name"] = name
     _STATE["ctx"] = ctx
     _STATE["mode"] = plan["mode"]
@@ -508,11 +506,12 @@ try:
     async def _status(request):
         why = ""
         try:
+            why = linux_cuda_plugin()
             import llama_cpp  # noqa: F401
 
             ok = True
-        except Exception:
-            ok, why = False, "llama-cpp-python isn't installed. Reinstall LC Vision from the Manager."
+        except Exception as exc:
+            ok, why = False, (llama_missing_hint(exc) or "llama-cpp-python isn't installed. Reinstall LC Vision from the Manager.")
         models = sorted(_discover_vision_models()) if ok else []
         if ok and not models:
             why = "No LC Vision model yet. Run an LC Vision Loader once and it downloads one."

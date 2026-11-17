@@ -78,6 +78,7 @@ function allNodes() {
   const walk = (list, host, depth) => {
     for (const n of list) {
       if (host) HOST.set(n, host);
+      else HOST.delete(n); // unpacked from a subgraph since the last walk
       out.push(n);
       const inner = n.subgraph?._nodes || n.subgraph?.nodes;
       if (inner && depth < 4) walk(inner, host || n, depth + 1);
@@ -92,7 +93,11 @@ const baseLabel = (n) => (n.title && n.title !== n.type ? n.title : (n.construct
 const label = (n) => (hostOf(n) ? `${baseLabel(n)} (inside "${baseLabel(hostOf(n))}")` : baseLabel(n));
 const typeTitle = (t) => LiteGraph.registered_node_types?.[t]?.title || t;
 const base = (f) => String(f || "").split(/[\\/]/).pop();
-const active = (n) => n.mode !== 2 && n.mode !== 4;
+// a node inside a muted or bypassed subgraph doesn't run either
+const active = (n) => n.mode !== 2 && n.mode !== 4 && (!hostOf(n) || (hostOf(n).mode !== 2 && hostOf(n).mode !== 4));
+// a widget fed by a link (a subgraph input, a primitive) keeps a stale value: the run uses the link's value instead.
+// A subgraph's promoted widget is checked on the subgraph node itself, where you change it.
+const linkFed = (n, w) => !!n.inputs?.some((i) => i.link != null && (i.widget?.name === w.name || i.name === w.name));
 
 // ------------------------------------------------------------------ machine
 function gpuGen(name) {
@@ -133,7 +138,8 @@ export async function report(refresh = false) {
 }
 
 export async function runReport() {
-  const r = await api.fetchApi("/lc123/syscheck/run");
+  const r = await api.fetchApi("/lc123/syscheck/run", { method: "POST" }); // POST only since LC123 1.54.5
+  if (!r.ok) throw new Error(`System Check failed (${r.status}). Update LC123, or run the report from LC123's settings.`);
   const j = await r.json();
   if (j.error) throw new Error(j.error);
   PROFILE = j;
@@ -199,6 +205,31 @@ export async function modelLoaders() {
   return out;
 }
 
+// System report tips the user chose to hide, by title (a ComfyUI setting, so it follows the user, not the browser)
+export const HIDDEN_TIPS = "LCVision.Assistant.HiddenTips";
+export function hiddenTips() {
+  const v = app.extensionManager?.setting?.get?.(HIDDEN_TIPS) ?? app.ui?.settings?.getSettingValue?.(HIDDEN_TIPS);
+  return Array.isArray(v) ? v : [];
+}
+export async function hideTips(titles) {
+  const next = [...new Set([...hiddenTips(), ...titles])];
+  if (app.extensionManager?.setting?.set) await app.extensionManager.setting.set(HIDDEN_TIPS, next);
+  else app.ui?.settings?.setSettingValue?.(HIDDEN_TIPS, next);
+}
+
+// Swaps and note conversions the user chose not to be offered, by node type (a ComfyUI setting, like the hidden tips)
+export const HIDDEN_SWAPS = "LCVision.Assistant.HiddenSwaps";
+export function hiddenSwaps() {
+  const v = app.extensionManager?.setting?.get?.(HIDDEN_SWAPS) ?? app.ui?.settings?.getSettingValue?.(HIDDEN_SWAPS);
+  return Array.isArray(v) ? v : [];
+}
+export async function hideSwaps(types) {
+  const next = [...new Set([...hiddenSwaps(), ...types])];
+  if (app.extensionManager?.setting?.set) await app.extensionManager.setting.set(HIDDEN_SWAPS, next);
+  else app.ui?.settings?.setSettingValue?.(HIDDEN_SWAPS, next);
+}
+const HIDE_SWAPS = { label: "Hide unticked", tip: "Stops offering the unticked ones. Bring them back in LC Settings ⚙️ > Vision > Hidden swaps.", run: { hideSwaps: true } };
+
 // ------------------------------------------------------------------ the checks
 export async function checkOptimization() {
   const cards = [];
@@ -220,14 +251,18 @@ export async function checkOptimization() {
     return cards;
   }
   const probs = (p.findings || []).filter((f) => f.level === 3);
-  const tips = (p.findings || []).filter((f) => f.level === 1);
+  // tips the user hid stay hidden (problems never do); LC Settings ⚙️ > Vision brings them back
+  const hidden = new Set(hiddenTips());
+  const tips = (p.findings || []).filter((f) => f.level === 1 && !hidden.has(f.title));
   const age = p.when ? Math.round((Date.now() - new Date(p.when.replace(" ", "T")).getTime()) / 86400000) : null;
   if (probs.length || tips.length) {
+    const actions = [{ label: "Run again", tip: "Runs LC123's system check again", run: "report" }];
+    if (tips.length) actions.push({ label: probs.length ? "Hide the tips" : "Hide these tips", tip: "Stops showing these tips. Problems still show. Bring them back in LC Settings ⚙️ > Vision.", run: { hideTips: tips.map((f) => f.title) } });
     cards.push({
       level: probs.length ? 3 : 1,
       title: `System report: ${probs.length} problem${probs.length === 1 ? "" : "s"}, ${tips.length} tip${tips.length === 1 ? "" : "s"}`,
       text: [...probs, ...tips].slice(0, 6).map((f) => `${f.level === 3 ? "⚠️" : "💡"} ${f.title}: ${f.text}`).join("\n"),
-      actions: [{ label: "Run again", tip: "Runs LC123's system check again", run: "report" }],
+      actions,
     });
   } else if (age !== null && age > 30) {
     cards.push({ level: 0, title: `Your system report is ${age} days old`, text: "Drivers and packs change. Run it again to be sure.", actions: [{ label: "Run report", run: "report" }] });
@@ -381,6 +416,13 @@ const FOLDER = { UNETLoader: "diffusion_models", UnetLoaderGGUF: "diffusion_mode
   CLIPLoaderGGUF: "text_encoders", DualCLIPLoader: "text_encoders", VAELoader: "vae", LoraLoader: "loras", LoraLoaderModelOnly: "loras",
   UpscaleModelLoader: "upscale_models", ControlNetLoader: "controlnet", LoadImage: "input" };
 
+// Model files their authors renamed: each group is one file under its old and new names (lower case)
+const RENAMED = [
+  // MiniMax H3 latent upscaler, renamed 2026-09-17
+  ["minimax_h3_latent_upscaler_3d_fp16.safetensors", "minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors"],
+  ["minimax_h3_latent_upscaler_3d_bf16.safetensors", "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"],
+];
+
 export async function checkMissingFiles() {
   const K = await knowledge();
   const cards = [];
@@ -391,7 +433,7 @@ export async function checkMissingFiles() {
     for (const w of n.widgets || []) {
       const vals = w.options?.values;
       if (w.type !== "combo" || !Array.isArray(vals) || !vals.length || !w.value || vals.includes(w.value)) continue;
-      if (typeof w.value !== "string" || !/\.\w{2,12}$/.test(w.value)) continue;
+      if (typeof w.value !== "string" || !/\.\w{2,12}$/.test(w.value) || linkFed(n, w)) continue;
       const file = base(w.value);
       const near = vals.filter((v) => typeof v === "string" && base(v).toLowerCase() === file.toLowerCase());
       if (near.length) {
@@ -427,6 +469,36 @@ export async function checkMissingFiles() {
         continue;
       }
       const stem = file.replace(/\.\w+$/, "");
+      const other = (RENAMED.find((g) => g.includes(file.toLowerCase())) || []).filter((x) => x !== file.toLowerCase());
+      const renamed = vals.filter((v) => typeof v === "string" && other.includes(base(v).toLowerCase()));
+      if (renamed.length) {
+        cards.push({
+          level: 3, title: `${file} was renamed`,
+          text: `${label(n)} asks for ${file}. Its author renamed that file, and you have it as ${base(renamed[0])}. It's the same model: one click switches to it.`,
+          nodeId: where(n),
+          actions: renamed.slice(0, 2).map((v) => ({ label: `Use ${base(v)}`, tip: `Sets ${w.name} to ${v}`, run: { set: [n, w.name, v] } })),
+        });
+        continue;
+      }
+      // the exact same file under another name: same size and fingerprint (saved in the workflow by 📌 Save download
+      // links or a snapshot, or LC123's list of Lonecat's models). Only local files whose size fits get read.
+      const known = n.graph?.extra?.vision_assistant?.models?.[w.value]
+        || Object.values((app.rootGraph || app.graph)?.extra?.vision_assistant?.snapshots || {}).map((s) => s?.files?.[w.value]).find(Boolean) || {};
+      let same = null;
+      try {
+        const r = await api.fetchApi("/lc_vision/assistant/renamed", { method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: w.value, hint: folder, size: known.size || null, sha256: known.sha256 || null }) });
+        same = (await r.json()).found;
+      } catch (_) {}
+      if (same && vals.includes(same)) {
+        cards.push({
+          level: 3, title: `${file} is here under another name`,
+          text: `${label(n)} asks for ${file}. You have that exact file (same size and fingerprint) as ${base(same)}. One click uses it.`,
+          nodeId: where(n),
+          actions: [{ label: `Use ${base(same)}`, tip: `Sets ${w.name} to ${same}`, run: { set: [n, w.name, same] } }],
+        });
+        continue;
+      }
       if (have.length) {
         cards.push({
           level: 3, title: `Missing: ${file} (you have the same model)`,
@@ -518,6 +590,12 @@ const PACK_HINTS = [
   [/\(LoraManager\)$/, "LoRA Manager", "https://github.com/willmiao/ComfyUI-Lora-Manager"],
   [/^BatchPromptSchedule|^PromptSchedule/, "FizzNodes", "https://github.com/FizzleDorf/ComfyUI_FizzNodes"],
   [/^(Text box|Text Multiline|Image Save|Text Concatenate)$/, "WAS Node Suite", "https://github.com/WASasquatch/was-node-suite-comfyui"],
+  [/^(MinimaxH3LatentUpscaler3D|MinimaxH3LatentUpscalerNode2D|MMH3TemporalSplitParamsV10|MMH3SpatialSplitParamsV10|MMH3SplitUpscale)$/, "Comfyui_Minimax_h3_latent_Upscaler", "https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler",
+    "The Manager installs a different pack under this name (xmarre's Plus fork, other settings), so install this one by hand: git clone it into custom_nodes, then restart."],
+  // only bbaudio's original has these; PlagueKind's fork registers the other MMH3 names and would replace the original's
+  [/^MMH3(FunControlnetParams|SpatialInpaintParams|TiledDiffusion)$/, "Comfyui-MMH3-UltimateUpscale", "https://github.com/bbaudio-2025/Comfyui-MMH3-UltimateUpscale",
+    "PlagueKind-Nodes uses the same MMH3 node names but doesn't have this one. With both packs installed, one silently replaces the other's MMH3 nodes."],
+  [/^MMH3/, "Comfyui-MMH3-UltimateUpscale", "https://github.com/bbaudio-2025/Comfyui-MMH3-UltimateUpscale"],
 ];
 
 const ghOwner = (href) => (String(href || "").match(/github\.com\/([^/]+)/) || [])[1] || "";
@@ -531,7 +609,7 @@ function packOf(n) {
   }
   if (p.aux_id) return { key: p.aux_id, name: p.aux_id.split("/").pop(), href: `https://github.com/${p.aux_id}` };
   const hit = PACK_HINTS.find(([rx]) => rx.test(n.type));
-  if (hit) return { key: hit[1], name: hit[1], href: hit[2] };
+  if (hit) return { key: hit[1], name: hit[1], href: hit[2], note: hit[3] };
   return { key: `?${n.type}`, name: "", href: "" };
 }
 
@@ -547,8 +625,12 @@ export function checkBrokenNodes() {
     t.get(n.type).push(n);
   }
   const cards = [];
+  // missing nodes the swap card can replace outright (settings and wires carry over)
+  const hiddenSw = new Set(hiddenSwaps());
+  const swappable = new Set(swap.find().filter((g) => !hiddenSw.has(g.sw.from)).flatMap((g) => g.nodes));
   for (const pk of packs.values()) {
     const all = [...pk.types.values()].flat();
+    const canSwap = all.filter((n) => swappable.has(n)).length;
     const types = [...pk.types.keys()];
     const swaps = types.map((t) => {
       const r = REPLACEMENTS[t] || {};
@@ -563,8 +645,9 @@ export function checkBrokenNodes() {
       level: 3,
       title: pk.name ? `Missing pack: ${pk.name} (${what})` : `Missing node: ${types[0]}`,
       text: `${pk.name ? `${what} from ${pk.name}${ghOwner(pk.href) ? ` (by ${ghOwner(pk.href)})` : ""} ${all.length === 1 ? "isn't" : "aren't"} installed: ${list}.` : `${what} of this type ${all.length === 1 ? "isn't" : "aren't"} installed.`}`
-        + (swapText ? ` Replacements you already have: ${swapText}.` : "")
-        + ` Install it from the Manager (Install Missing Custom Nodes)${pk.href ? " or from its page" : ""}.`,
+        + (canSwap ? ` The Swap for LC nodes card replaces ${canSwap === all.length ? (all.length === 1 ? "it" : "all of them") : `${canSwap} of them`}, settings and wires included.` : "")
+        + (swapText && canSwap < all.length ? ` Replacements you already have: ${swapText}.` : "")
+        + (pk.note ? ` ${pk.note}` : ` Install it from the Manager (Install Missing Custom Nodes)${pk.href ? " or from its page" : ""}.`),
       nodeId: where(all[0]),
       nodeIds: [...new Set(all.map(where))],
       actions: [
@@ -579,9 +662,100 @@ export function checkBrokenNodes() {
   return cards;
 }
 
+// ------------------------------------------------------------------ same node name, different pack
+// The settings each node had in the workflow file. The live graph drops or re-adds the ones the installed node doesn't
+// match, so they're kept here as loaded.
+const SAVED = new Map();
+const savedKey = (type, id) => `${type}#${id}`;
+app.registerExtension({
+  name: "LC.VisionAssistant.SavedInputs",
+  beforeConfigureGraph(data) {
+    SAVED.clear();
+    const add = (list) => {
+      for (const n of list || []) if (n?.type) SAVED.set(savedKey(n.type, n.id), (n.inputs || []).filter((i) => i.widget).map((i) => i.widget.name || i.name));
+    };
+    add(data?.nodes);
+    for (const sg of data?.definitions?.subgraphs || []) add(sg.nodes);
+  },
+});
+
+// One node name, more than one pack. marker = settings only that pack has.
+const CLASHES = {
+  MinimaxH3LatentUpscaler3D: [
+    { marker: ["enable_temporal_chunking"], folder: "Comfyui_Minimax_h3_latent_Upscaler", name: "the original H3 latent upscaler by LBH-123-AI", href: "https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler" },
+    { marker: ["keep_proportion", "offload_after_upscale"], folder: "Comfyui_Minimax_h3_latent_Upscaler-Plus", name: "xmarre's Plus fork (the one the Manager installs)", href: "https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus" },
+  ],
+  // bbaudio's MMH3 UltimateUpscale vs PlagueKind's fork inside PlagueKind-Nodes (same node names)
+  MMH3SpatialSplitParams: [
+    { marker: ["brightness_match", "dynamic_fade", "dynamic_fade_min", "masked_area_noise"], folder: "Comfyui-MMH3-UltimateUpscale", name: "bbaudio's original MMH3 UltimateUpscale", href: "https://github.com/bbaudio-2025/Comfyui-MMH3-UltimateUpscale" },
+    { marker: ["joint_steps", "token_budget"], folder: "ComfyUI-PlagueKind-Nodes", name: "PlagueKind's fork (in PlagueKind-Nodes)", href: "https://github.com/PlagueKind/ComfyUI-PlagueKind-Nodes" },
+  ],
+  MMH3LatentUpscaleWithModelParams: [
+    { marker: ["offload_model"], folder: "Comfyui-MMH3-UltimateUpscale", name: "bbaudio's original MMH3 UltimateUpscale", href: "https://github.com/bbaudio-2025/Comfyui-MMH3-UltimateUpscale" },
+  ],
+};
+
+// old wired inputs a node's own JS still reads on purpose
+const KEPT_ON_PURPOSE = { LCSigmas: ["scheduler_shape"] };
+
+function defInputs(type) {
+  const d = LiteGraph.registered_node_types?.[type]?.nodeData?.input;
+  if (!d) return null;
+  const names = new Set();
+  for (const sec of [d.required, d.optional, d.hidden]) for (const [k, spec] of Object.entries(sec || {})) {
+    if (/^COMFY_(AUTOGROW|DYNAMICGROUP)/.test(spec?.[0])) return null; // inputs that grow: their names can't be known
+    names.add(k);
+    // dynamic combos save their sub-settings as "mode.scale"
+    for (const o of spec?.[1]?.options || []) if (o && typeof o === "object") for (const s of [o.inputs?.required, o.inputs?.optional]) for (const sub of Object.keys(s || {})) names.add(`${k}.${sub}`);
+  }
+  return names;
+}
+
+/** A node that loads, but the workflow saved settings it doesn't have: another pack under the same name, or another version. */
+export function checkWrongPack() {
+  const byType = new Map();
+  for (const n of allNodes()) {
+    if (n.subgraph || /^[0-9a-f-]{36}$/i.test(n.type)) continue; // a subgraph's inputs are its own
+    const names = defInputs(n.type);
+    if (!names) continue;
+    const has = (x) => names.has(x) || n.widgets?.some((w) => w.name === x) || KEPT_ON_PURPOSE[n.type]?.includes(x); // widgets added in JS are fine
+    const orphans = (n.inputs || []).filter((i) => i.widget).map((i) => i.widget.name || i.name);
+    const extra = [...new Set([...(SAVED.get(savedKey(n.type, n.id)) || []), ...orphans])].filter((x) => !has(x));
+    if (!extra.length) continue;
+    if (!byType.has(n.type)) byType.set(n.type, { nodes: [], extra: new Set() });
+    const g = byType.get(n.type);
+    g.nodes.push(n);
+    extra.forEach((x) => g.extra.add(x));
+  }
+  const cards = [];
+  for (const [type, g] of byType) {
+    const extra = [...g.extra];
+    const mod = String(LiteGraph.registered_node_types[type].nodeData?.python_module || "");
+    const folder = /^custom_nodes\./.test(mod) ? mod.replace(/^custom_nodes\./, "") : mod ? "ComfyUI" : "";
+    const want = (CLASHES[type] || []).find((p) => p.marker.some((m) => extra.includes(m)));
+    const what = g.nodes.length === 1 ? label(g.nodes[0]) : `${g.nodes.length} ${typeTitle(type)} nodes`;
+    const was = g.nodes.length === 1 ? "was" : "were";
+    const list = extra.slice(0, 4).join(", ") + (extra.length > 4 ? ` and ${extra.length - 4} more` : "");
+    cards.push(want && want.folder !== folder.split(".")[0] ? {
+      level: 3, title: `Wrong pack: ${typeTitle(type)}`,
+      text: `${what} ${was} saved with ${want.name}, but this ComfyUI has ${folder || "another pack"}. Both packs use the name ${type} with different settings (this workflow has ${list}), so the Manager can't sort it out.`
+        + ` In custom_nodes keep only ${want.folder}: move the other folder out, git clone this one, restart.`,
+      nodeId: where(g.nodes[0]), nodeIds: [...new Set(g.nodes.map(where))],
+      actions: [{ label: "Pack page", tip: want.href, href: want.href }],
+    } : {
+      level: 1, title: `${typeTitle(type)} doesn't match this workflow`,
+      text: `${what} ${was} saved with settings this node doesn't have: ${list}. Usually ${folder || "its pack"} changed since the workflow was saved, and those settings were removed or renamed. If the node runs fine, ignore this.`
+        + " If it fails or acts strange, update the pack and restart. Still failing: the workflow was made with a different pack that uses the same node name, so check which pack the author used.",
+      nodeId: where(g.nodes[0]), nodeIds: [...new Set(g.nodes.map(where))], actions: [],
+    });
+  }
+  return cards;
+}
+
 // ------------------------------------------------------------------ swap for LC nodes (first card in the checkup)
 export function checkSwaps() {
-  const groups = swap.find().filter((g) => g.nodes.length);
+  const hidden = new Set(hiddenSwaps());
+  const groups = swap.find().filter((g) => g.nodes.length && !hidden.has(g.sw.from));
   if (!groups.length) return [];
   const count = groups.reduce((k, g) => k + g.nodes.length, 0);
   const nodes = groups.flatMap((g) => g.nodes);
@@ -592,7 +766,7 @@ export function checkSwaps() {
     swap: groups.map((g) => ({ from: g.sw.from, to: [...g.targets].map(swap.titleOf).join(" / "), count: g.nodes.length, drops: [...g.drops], blocked: g.blocked.length, why: g.blocked[0]?.why || "" })),
     nodeId: where(nodes[0]),
     nodeIds: [...new Set(nodes.map(where))],
-    actions: [{ label: "Swap ticked", tip: "Replaces every ticked node with its LC twin, keeping settings and wires", run: { swap: true } }],
+    actions: [{ label: "Swap ticked", tip: "Replaces every ticked node with its LC twin, keeping settings and wires", run: { swap: true } }, HIDE_SWAPS],
   }];
 }
 
@@ -602,7 +776,8 @@ export function swapTypes(types) {
 
 /** Every note that isn't an LC Note yet (core Note, Markdown Note, any other note node). */
 export function checkNotes() {
-  const groups = swap.findNotes().filter((g) => g.nodes.length);
+  const hidden = new Set(hiddenSwaps());
+  const groups = swap.findNotes().filter((g) => g.nodes.length && !hidden.has(g.sw.from));
   if (!groups.length) return [];
   const count = groups.reduce((k, g) => k + g.nodes.length, 0);
   const nodes = groups.flatMap((g) => g.nodes);
@@ -613,7 +788,7 @@ export function checkNotes() {
     swap: groups.map((g) => ({ from: swap.titleOf(g.sw.from), key: g.sw.from, to: "LC Note 📝", count: g.nodes.length, drops: [], blocked: 0, why: "" })),
     nodeId: where(nodes[0]),
     nodeIds: [...new Set(nodes.map(where))],
-    actions: [{ label: "Convert ticked", tip: "Turns every ticked note into an LC Note, keeping its text, title, colours and place", run: { swap: true, notes: true } }],
+    actions: [{ label: "Convert ticked", tip: "Turns every ticked note into an LC Note, keeping its text, title, colours and place", run: { swap: true, notes: true } }, HIDE_SWAPS],
   }];
 }
 
@@ -1073,10 +1248,28 @@ export async function symptomReport(question) {
   return out;
 }
 
+// token bench 2026-10-25: on 8 GB and less, a 7B+ vision model and long captions cost the most time for the least gain
+export async function checkVisionFit() {
+  const cards = [];
+  const sys = await system();
+  if (!sys.vram || sys.vram > 8.5) return cards;
+  const gb = Math.round(sys.vram);
+  const big = allNodes().filter((n) => n.type === "LCVisionLoader" && active(n)).map((n) => [n, +(/(\d+(?:\.\d+)?)\s*b\b/i.exec(String(valueOf(n, "model_name") || ""))?.[1] || 0)]).filter(([, b]) => b >= 7);
+  const long = allNodes().filter((n) => /^LCVision(Caption|PromptEnhancer)$/.test(n.type) && active(n) && (num(valueOf(n, "max_tokens")) || 0) > 700);
+  if (!big.length && !long.length) return cards;
+  const what = [...big.map(([n, b]) => `- ${label(n)}: ${b}B model`), ...long.map((n) => `- ${label(n)}: max_tokens ${valueOf(n, "max_tokens")}`)];
+  cards.push({
+    level: 1, title: `Your ${gb} GB card is better suited for a 2B or 4B vision model and 250 - 500 tokens`, nodeId: where((big[0] || [])[0] || long[0]),
+    text: `${what.join("\n")}\nOn ${gb} GB the bigger model spills out of VRAM and writes slowly, and every 250 prompt tokens adds about 7% to each image. Use the small setup for test runs (max_tokens around 700) and go bigger for the images that matter.`,
+    actions: [],
+  });
+  return cards;
+}
+
 export async function checkAll() {
   const out = [];
   GATES.clear(); // accepted a license since the last check? ask again
-  for (const f of [checkSwaps, checkNotes, checkErrors, checkCorruption, checkBrokenNodes, checkMissingFiles, checkGatedDownloads, checkClipType, checkStepsModel, checkCommon, checkModelFormat, checkOptimization]) {
+  for (const f of [checkSwaps, checkNotes, checkErrors, checkCorruption, checkBrokenNodes, checkWrongPack, checkMissingFiles, checkGatedDownloads, checkClipType, checkStepsModel, checkCommon, checkModelFormat, checkOptimization, checkVisionFit]) {
     try {
       out.push(...(await f()));
     } catch (e) {

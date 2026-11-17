@@ -183,11 +183,11 @@ export async function save(dir, quiet = false, auto = false) {
 const itemsKey = (items) => JSON.stringify((items || []).map((x) => [x.file, x.role, x.name, x.on !== false]));
 
 async function load(dir, name) {
-  const d = await fetch(`/lc_vision/movie/project?project=${encodeURIComponent(name)}&t=${Date.now()}`, { cache: "no-store" }).then((x) => x.json()).catch(() => ({}));
+  const d = await fetch(`/lc_vision/movie/project?project=${encodeURIComponent(name)}&t=${Date.now()}`, { cache: "no-store" }).then((x) => (x.ok ? x.json() : {})).catch(() => ({}));
   const src = await projectSource(dir);
   // the project we are leaving: its saved pictures tell us whether the Assembler still holds just those
   const leaving = src.name && src.name !== name
-    ? await fetch(`/lc_vision/movie/project?project=${encodeURIComponent(src.name)}&t=${Date.now()}`, { cache: "no-store" }).then((x) => x.json()).catch(() => ({}))
+    ? await fetch(`/lc_vision/movie/project?project=${encodeURIComponent(src.name)}&t=${Date.now()}`, { cache: "no-store" }).then((x) => (x.ok ? x.json() : {})).catch(() => ({}))
     : {};
   const pw = widget(src.node, src.key);
   if (pw) pw.value = name;
@@ -307,7 +307,15 @@ api.queuePrompt = async function (...args) {
   // awaited: with the project on a wire, save() first resolves the name (graphToPrompt), and the queue request went
   // out ahead of it, so the Storyboard Builder could read the project file from before this Run
   if (runs) await save(dir, true, true).catch(() => {});
-  return origQueue(...args);
+  const res = await origQueue(...args);
+  // replan is one shot: left on, every chained segment run wrote a new plan and set the segment just made aside,
+  // so the chain made segment 1 over and over. This run already carries replan on; the next ones reuse its plan.
+  const rw = runs && dir.widgets?.find((w) => w.name === "replan");
+  if (rw?.value === true && args[1].output[String(dir.id)].inputs?.replan === true) {
+    rw.value = false;
+    dir.setDirtyCanvas?.(true, true);
+  }
+  return res;
 };
 
 app.registerExtension({

@@ -15,7 +15,9 @@ what comes next. Read only, apart from cached thumbnails.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
+import filecmp
 import json
 import os
 import re
@@ -305,7 +307,7 @@ def undo_last(project: str) -> dict:
         set_join(project, i, e.get("before", "cut"), record=False)
         note = f"Segment {i} {'keeps rolling' if e.get('before') == 'roll' else 'opens on a cut'} again."
     elif kind == "cut":
-        r = undo_cut(project, os.path.join(work_dir(folder), e.get("dir", "")))
+        r = undo_cut(project, os.path.join(work_dir(folder), os.path.basename(str(e.get("dir", "")))))
         h = _hist(folder)  # undo_cut doesn't touch the history
         note = f"Shot {e.get('shot', '')} is back as segment {r['restored'][0]}."
     else:
@@ -764,8 +766,8 @@ def insert_shot(project: str, index: int, shot: dict) -> dict:
 
 def undo_insert(project: str, index: int, snap_dir: str) -> dict:
     folder = _folder(project)
-    snap = os.path.join(work_dir(folder), snap_dir)
-    if not os.path.exists(os.path.join(snap, "plan.json")):
+    snap = os.path.join(work_dir(folder), os.path.basename(str(snap_dir)))
+    if not os.path.basename(str(snap_dir)) or not os.path.exists(os.path.join(snap, "plan.json")):
         raise ValueError("The inserted shot's snapshot is gone, so it can't be undone.")
     work = work_dir(folder)
     for n in os.listdir(work):  # the inserted segment, if it was made, stays as a take (its takes too: the later
@@ -841,6 +843,19 @@ def _input_dir() -> str:
     return folder_paths.get_input_directory()
 
 
+_ASSET_EXT = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".mp4", ".webm", ".mov", ".mkv", ".wav", ".mp3", ".flac")
+
+
+def _input_file(rel: str) -> str | None:
+    """rel (a reference's file, relative to ComfyUI's input folder) as a real path inside it, or None: a path that
+    leaves the input folder (absolute, drive letter, ..) or isn't a picture / video / sound is never read."""
+    inp = os.path.realpath(_input_dir())
+    src = os.path.realpath(os.path.join(inp, str(rel or "")))
+    if os.path.commonpath([src, inp]) != inp or not src.lower().endswith(_ASSET_EXT) or not os.path.isfile(src):
+        return None
+    return src
+
+
 def sync_assets(folder: str, data: dict) -> int:
     """Every Reference Assembler card (and every Storyboard picture) as a portable asset: its file copied into
     <project>/assets/ and its card (role, name, note, crop, on, ...) in assets/assets.json, so another project can
@@ -856,8 +871,8 @@ def sync_assets(folder: str, data: dict) -> int:
     old = (_load(os.path.join(adir, "assets.json")) or {}).get("items", [])
     cards = []
     for it in items:
-        src = os.path.join(_input_dir(), str(it.get("file") or ""))
-        if not it.get("file") or not os.path.isfile(src):
+        src = _input_file(it.get("file"))
+        if not src:
             continue
         name = os.path.basename(src)
         dst = os.path.join(adir, name)
@@ -905,11 +920,12 @@ def import_assets(source: str, target: str, ids: list) -> dict:
     for it in d.get("items", []):
         if want and str(it.get("id")) not in want:
             continue
-        srcf = os.path.join(src_folder, "assets", it.get("file", ""))
-        if not os.path.isfile(srcf):
+        fname = os.path.basename(str(it.get("file", "")))
+        srcf = os.path.join(src_folder, "assets", fname)
+        if not fname or not os.path.isfile(srcf):
             continue
-        base, ext = os.path.splitext(it["file"])
-        name, k = it["file"], 2
+        base, ext = os.path.splitext(fname)
+        name, k = fname, 2
         while os.path.exists(os.path.join(_input_dir(), sub, name)) and not _same_file(srcf, os.path.join(_input_dir(), sub, name)):
             name, k = f"{base}_{k}{ext}", k + 1
         dst = os.path.join(_input_dir(), sub, name)
@@ -917,7 +933,7 @@ def import_assets(source: str, target: str, ids: list) -> dict:
             shutil.copy2(srcf, dst)
         card = {k2: it[k2] for k2 in _CARD_KEYS if k2 in it}
         card.update({"file": f"{sub}/{name}".replace("\\", "/"), "imported_from": os.path.basename(src_folder),
-                     "asset_of": os.path.basename(src_folder), "asset_file": it["file"]})
+                     "asset_of": os.path.basename(src_folder), "asset_file": fname})
         out.append(card)
     return {"items": out}
 
@@ -942,7 +958,7 @@ def update_asset(project: str, file: str, fields: dict) -> dict:
 
 
 def _same_file(a: str, b: str) -> bool:
-    return os.path.getsize(a) == os.path.getsize(b) and open(a, "rb").read() == open(b, "rb").read()
+    return filecmp.cmp(a, b, shallow=False)  # size first, then the bytes in chunks; files are closed
 
 
 def save_project(project: str, data: dict) -> str:
@@ -963,6 +979,18 @@ def save_project(project: str, data: dict) -> str:
     return path
 
 
+def _ffmpeg_bin() -> str | None:
+    ff = shutil.which("ffmpeg")
+    if ff:
+        return ff
+    # no ffmpeg on PATH (common on portable installs): the copy imageio-ffmpeg ships (VHS installs it), as LC_AV does
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
 def thumb(project: str, i: int) -> str | None:
     folder = _folder(project)
     if not folder:
@@ -972,7 +1000,7 @@ def thumb(project: str, i: int) -> str | None:
     if not os.path.exists(src):
         return None
     if not os.path.exists(dst) or os.path.getmtime(dst) < os.path.getmtime(src):
-        ff = shutil.which("ffmpeg")
+        ff = _ffmpeg_bin()
         if not ff:
             return None
         subprocess.run([ff, "-y", "-v", "error", "-ss", "2.5", "-i", src, "-frames:v", "1", "-vf", "scale=320:-2", "-q:v", "4", dst],
@@ -984,17 +1012,31 @@ try:
     from aiohttp import web
     from server import PromptServer
 
+    def _get_error(route: str, exc: Exception, **empty):
+        # a GET that fails answers {"error"} plus the empty value its callers read, not a bare 500
+        print(f"[LC Vision] {route}: {exc}")
+        return web.json_response({"error": str(exc), **empty}, status=400)
+
     @PromptServer.instance.routes.get("/lc_vision/movie/projects")
     async def _projects_route(request):
-        return web.json_response({"projects": projects()})
+        try:
+            return web.json_response({"projects": projects()})
+        except Exception as exc:
+            return _get_error("movie/projects", exc, projects=[])
 
     @PromptServer.instance.routes.get("/lc_vision/movie/status")
     async def _status_route(request):
-        return web.json_response(status(request.query.get("project", "")))
+        try:
+            return web.json_response(status(request.query.get("project", "")))
+        except Exception as exc:
+            return _get_error("movie/status", exc)
 
     @PromptServer.instance.routes.get("/lc_vision/movie/project")
     async def _project_get(request):
-        return web.json_response(load_project(request.query.get("project", "")))
+        try:
+            return web.json_response(load_project(request.query.get("project", "")))
+        except Exception as exc:
+            return _get_error("movie/project", exc)
 
     @PromptServer.instance.routes.post("/lc_vision/movie/segment")
     async def _segment_post(request):
@@ -1050,11 +1092,17 @@ try:
     @PromptServer.instance.routes.get("/lc_vision/movie/impact")
     async def _impact(request):
         q = request.query
-        return web.json_response(impact(q.get("project", ""), int(q.get("index", "0") or 0), q.get("action", "")))
+        try:
+            return web.json_response(impact(q.get("project", ""), int(q.get("index", "0") or 0), q.get("action", "")))
+        except Exception as exc:
+            return _get_error("movie/impact", exc, warnings=[])
 
     @PromptServer.instance.routes.get("/lc_vision/assets")
     async def _assets(request):
-        return web.json_response(list_assets(request.query.get("project", "")))
+        try:
+            return web.json_response(list_assets(request.query.get("project", "")))
+        except Exception as exc:
+            return _get_error("assets", exc, items=[])
 
     @PromptServer.instance.routes.post("/lc_vision/assets/update")
     async def _assets_update(request):
@@ -1086,7 +1134,12 @@ try:
             i = int(request.query.get("i", "0"))
         except ValueError:
             i = 0
-        path = thumb(request.query.get("project", ""), i)
+        try:
+            # ffmpeg runs in a worker thread, so a Proof Sheet full of new thumbs doesn't block the server
+            path = await asyncio.to_thread(thumb, request.query.get("project", ""), i)
+        except Exception as exc:
+            print(f"[LC Vision] movie/thumb: {exc}")
+            path = None
         if not path:
             return web.Response(status=404)
         return web.FileResponse(path, headers={"Cache-Control": "no-cache"})

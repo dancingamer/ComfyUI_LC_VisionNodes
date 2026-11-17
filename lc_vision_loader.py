@@ -21,13 +21,232 @@ import os
 import re
 import struct
 import sys
-import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import folder_paths
 
 LLM_FOLDER_KEY = "LLM"
+# module name -> pip name, for llama-cpp-python's own dependencies (install.py adds these with the wheel)
+_PIP_NAMES = {"typing_extensions": "typing-extensions", "jinja2": "jinja2", "diskcache": "diskcache", "numpy": "numpy"}
+
+
+def llama_missing_hint(exc: BaseException) -> str:
+    """When llama_cpp fails because one of ITS dependencies is missing, the exact command that fixes it
+    (for ComfyUI's own Python). Empty for any other failure. Never installs anything."""
+    name = getattr(exc, "name", None) if isinstance(exc, ModuleNotFoundError) else None
+    if not name or name.split(".")[0] == "llama_cpp":
+        return ""
+    top = name.split(".")[0]
+    pkg = _PIP_NAMES.get(top, top)
+    return f"Missing '{pkg}'. Run: \"{sys.executable}\" -m pip install {pkg}  then restart ComfyUI."
+
+
+_CUDA12_LIBS = ("libcudart.so.12", "libcublasLt.so.12", "libcublas.so.12", "libnccl.so.2")
+_cuda_plugin_state: Optional[str] = None
+
+
+def linux_cuda_plugin() -> str:
+    """Linux only, before llama_cpp is imported. The fork's Linux wheels keep CUDA in a plugin
+    (lib/libggml-cuda.so) that needs CUDA 12 libraries; when the system can't find them llama.cpp skips
+    the plugin without a word and runs on CPU. Load them from the venv's nvidia pip packages (the ones
+    a cu12 torch ships) so the plugin finds them. Returns '' when the plugin loads (or there's nothing to
+    do), else the reason. Runs once."""
+    global _cuda_plugin_state
+    if _cuda_plugin_state is not None:
+        return _cuda_plugin_state
+    _cuda_plugin_state = ""
+    if not sys.platform.startswith("linux"):
+        return ""
+    import ctypes
+    import glob
+    import importlib.util
+    import site
+
+    try:
+        spec = importlib.util.find_spec("llama_cpp")
+    except Exception:
+        return ""
+    if not spec or not spec.origin:
+        return ""
+    lib = os.path.join(os.path.dirname(spec.origin), "lib")
+    plugin = os.path.join(lib, "libggml-cuda.so")
+    if not os.path.exists(plugin):
+        return ""  # CUDA linked in (a source build) or no CUDA at all: nothing to load
+
+    def _try() -> str:
+        try:
+            for base in ("libggml-base.so.0", "libggml-base.so"):
+                if os.path.exists(os.path.join(lib, base)):
+                    ctypes.CDLL(os.path.join(lib, base), mode=ctypes.RTLD_GLOBAL)
+                    break
+            ctypes.CDLL(plugin, mode=ctypes.RTLD_GLOBAL)
+            return ""
+        except OSError as exc:
+            return str(exc)
+
+    err = _try()
+    if err:
+        dirs = [p for p in sys.path if p.endswith(("site-packages", "dist-packages"))]
+        try:
+            dirs += site.getsitepackages()
+        except Exception:
+            pass
+        for name in _CUDA12_LIBS:
+            for d in dict.fromkeys(dirs):
+                hits = glob.glob(os.path.join(d, "nvidia", "*", "lib", name))
+                if hits:
+                    try:
+                        ctypes.CDLL(hits[0], mode=ctypes.RTLD_GLOBAL)
+                    except OSError:
+                        pass
+                    break
+        err = _try()
+    if err:
+        _cuda_plugin_state = (
+            f"llama-cpp's CUDA plugin cannot load ({err}), so LC Vision runs on CPU. Install the CUDA 12 runtime "
+            "libraries, or build llama-cpp-python against your own CUDA:  "
+            f"CMAKE_ARGS=\"-DGGML_CUDA=on\" \"{sys.executable}\" -m pip install "
+            "\"llama-cpp-python @ git+https://github.com/JamePeng/llama-cpp-python.git\""
+        )
+        print(f"[LC Vision] {_cuda_plugin_state}")
+    return _cuda_plugin_state
+
+
+def _llama_lib_dir() -> Optional[str]:
+    """llama_cpp's own lib folder (its ggml / llama libraries and backend plugins), found without importing it."""
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec("llama_cpp")
+    except Exception:
+        return None
+    if not spec or not spec.origin:
+        return None
+    return os.path.join(os.path.dirname(spec.origin), "lib")
+
+
+_ggml_preloaded: list = []
+
+
+def preload_own_ggml() -> None:
+    """At ComfyUI startup: load llama_cpp's own ggml-base and ggml libraries by full path before anything else can
+    bring its own copy. Windows hands an already-loaded DLL to anything that asks for that name, and Linux matches
+    by soname (libggml.so.0), so when another pack's ggml, or a system package's (/usr/lib/libggml.so.0 from
+    pacman / apt), gets in first, the fork's backend plugins bind to it, all fail, and every model load ends with
+    "backend registry count: 0". Set LC_VISION_NO_GGML_PRELOAD=1 to skip this."""
+    if sys.platform not in ("win32", "linux") or os.environ.get("LC_VISION_NO_GGML_PRELOAD") or "llama_cpp" in sys.modules:
+        return
+    lib = _llama_lib_dir()
+    if not lib or not os.path.isdir(lib):
+        return
+    import ctypes
+
+    if sys.platform == "win32":
+        for name in ("ggml-base.dll", "ggml.dll"):
+            path = os.path.join(lib, name)
+            if not os.path.exists(path):
+                return
+            try:
+                ctypes.CDLL(path)
+                _ggml_preloaded.append(name)
+            except OSError:
+                return
+        return
+    import glob
+
+    for stem in ("libggml-base.so", "libggml.so"):
+        # the soname file the plugins ask for (libggml.so.0) first, then the plain or fully versioned one
+        hits = sorted(glob.glob(os.path.join(lib, stem + "*")), key=lambda p: (not p.endswith(stem + ".0"), len(p)))
+        if not hits:
+            return
+        try:
+            ctypes.CDLL(hits[0], mode=ctypes.RTLD_GLOBAL)
+            _ggml_preloaded.append(os.path.basename(hits[0]))
+        except OSError:
+            return
+
+
+def _loaded_ggml_libs() -> list:
+    """Full paths of every ggml / llama library loaded in this process."""
+    names = ("ggml", "llama", "libggml", "libllama")
+    paths = []
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+
+            k32, psapi = ctypes.WinDLL("kernel32"), ctypes.WinDLL("psapi")
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            k32.GetModuleFileNameW.argtypes = [wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
+            psapi.EnumProcessModules.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.HMODULE), wintypes.DWORD,
+                                                 ctypes.POINTER(wintypes.DWORD)]
+            mods, need = (wintypes.HMODULE * 4096)(), wintypes.DWORD()
+            if psapi.EnumProcessModules(k32.GetCurrentProcess(), mods, ctypes.sizeof(mods), ctypes.byref(need)):
+                for h in mods[:min(need.value // ctypes.sizeof(wintypes.HMODULE), 4096)]:
+                    buf = ctypes.create_unicode_buffer(1024)
+                    if k32.GetModuleFileNameW(h, buf, 1024):
+                        paths.append(buf.value)
+        elif os.path.exists("/proc/self/maps"):
+            with open("/proc/self/maps", encoding="utf-8", errors="replace") as f:
+                paths = list(dict.fromkeys(line.split(None, 5)[-1].strip() for line in f if "/" in line))
+    except Exception:
+        return []
+    return [p for p in paths if os.path.basename(p).lower().startswith(names)]
+
+
+def llama_load_hint(exc: BaseException) -> str:
+    """When a model fails because llama.cpp has no backends at all (count 0), why, and which other pack's ggml is in
+    the way. Empty for any other failure. (The count is 0 until the first Llama() loads the plugins, so it only means
+    something together with llama's own "Failed to load model".)"""
+    if "Failed to load model" not in str(exc) and "no backends" not in str(exc):
+        return ""
+    try:
+        from llama_cpp._ggml import ggml_backend_reg_count
+
+        if int(ggml_backend_reg_count()) != 0:
+            return ""
+    except Exception:
+        if "no backends" not in str(exc):
+            return ""
+    lib = _llama_lib_dir() or "llama_cpp/lib"
+    own = os.path.normcase(os.path.abspath(lib))
+    foreign = [p for p in _loaded_ggml_libs() if os.path.normcase(os.path.dirname(os.path.abspath(p))) != own]
+    msg = (f"[LC Vision] llama.cpp has no backends loaded (registry count 0), so no model can load: its CPU and CUDA "
+           f"plugins in {lib} all failed to load.")
+    if foreign:
+        msg += ("\nAnother copy of ggml / llama.cpp is already loaded in this ComfyUI (another custom node pack, or a "
+                "system package), and the plugins bound to it instead:\n  " + "\n  ".join(foreign))
+        if sys.platform == "win32":
+            msg += ("\nDisable the pack that owns that folder (or ask its author to use the shared llama-cpp-python), "
+                    "then restart ComfyUI.")
+        else:
+            msg += (f"\nIf it is a system package (/usr/lib), start ComfyUI with LD_LIBRARY_PATH=\"{lib}\" in front, or "
+                    "remove the system ggml / llama.cpp package. If it is another pack, disable it. Then restart ComfyUI.")
+    else:
+        fix = ("install the latest Microsoft Visual C++ Redistributable (x64), or run this pack's install.py again"
+               if sys.platform == "win32" else "run this pack's install.py again")
+        msg += f"\nNo other copy of ggml is loaded, so the plugins themselves would not load: {fix}, then restart ComfyUI."
+    return msg
+
+
+def new_llama(**kwargs):
+    """Llama(**kwargs) with a clear error when llama.cpp has no backends."""
+    from llama_cpp import Llama
+
+    try:
+        return Llama(**kwargs)
+    except Exception as exc:
+        hint = llama_load_hint(exc)
+        if hint:
+            print(hint)
+            raise RuntimeError(hint) from exc
+        raise
+
+
+preload_own_ggml()
+
+
 NODE_ID = "LCVisionLoader"
 NODE_DISPLAY_NAME = "LC Vision Loader 🔬"
 MODEL_TYPE = "LC_VISION_MODEL"
@@ -250,6 +469,15 @@ CURATED_DOWNLOADS: dict[str, dict[str, str]] = {
 }
 
 
+def _download_label(key: str) -> tuple[str, str]:
+    """'Qwen3-VL-8B-abliterated (Q8_0, ~9.9GB total)' -> ('Qwen3-VL-8B-abliterated (Q8_0)', '~9.9GB total')."""
+    name = key[len(DOWNLOAD_LABEL_PREFIX):] if key.startswith(DOWNLOAD_LABEL_PREFIX) else key
+    m = re.match(r"^(.*) \((.*), (~[^)]*)\)$", name)
+    if m:
+        return f"{m.group(1)} ({m.group(2)})", m.group(3)
+    return name, ""
+
+
 _THINK_BLOCK = re.compile(r"(?is)<think>.*?</think>")
 
 
@@ -282,67 +510,59 @@ def _curated_target_dir() -> str:
     return base_dir
 
 
-def _download_with_progress(url: str, dest_path: str) -> None:
-    """Resumable-ish fallback downloader (Range-header resume, no external
-    dependency) for when huggingface_hub isn't importable. Writes to a
-    .part file and renames on completion so a crash mid-download can't
-    leave a truncated file mistaken for a finished one."""
-    part_path = dest_path + ".part"
-    existing = os.path.getsize(part_path) if os.path.exists(part_path) else 0
-
-    req = urllib.request.Request(url)
-    if existing:
-        req.add_header("Range", f"bytes={existing}-")
-
-    with urllib.request.urlopen(req) as resp:
-        total = resp.length
-        total_str = f"{(existing + total) / (1024 ** 3):.2f}GB" if total else "unknown size"
-        mode = "ab" if existing and resp.status == 206 else "wb"
-        if mode == "wb":
-            existing = 0
-        downloaded = existing
-        last_pct = -1
-        with open(part_path, mode) as f:
-            while True:
-                chunk = resp.read(1024 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
-                downloaded += len(chunk)
-                if total:
-                    pct = int(downloaded * 100 / (existing + total)) if mode == "ab" else int(downloaded * 100 / total)
-                    if pct != last_pct and pct % 5 == 0:
-                        print(f"[LC Vision] Downloading {os.path.basename(dest_path)}: {pct}% of {total_str}")
-                        last_pct = pct
-    os.replace(part_path, dest_path)
+# every curated download is pinned to one commit of its repo and checked against the file's sha256 afterwards
+PINNED: dict[str, tuple[str, dict[str, str]]] = {
+    "mradermacher/Qwen3-VL-4B-Instruct-c_abliterated-v2-GGUF": ("659915fa666b816ece4e18128103dd013322be53", {
+        "Qwen3-VL-4B-Instruct-c_abliterated-v2.Q8_0.gguf": "68928bf53036bdd6b335fadcbe83e320fadbace1010466ca295475fb6cb8d992",
+        "Qwen3-VL-4B-Instruct-c_abliterated-v2.f16.gguf": "01e12fe9358176c2d0096d778c35f035fc615fbd8c284851f3148d77a3c9d39c",
+        "Qwen3-VL-4B-Instruct-c_abliterated-v2.mmproj-f16.gguf": "11ac51033acba21b650cb9724f27180a4d2abbca2784fba563e8b80f4c64ba0c",
+    }),
+    "prithivMLmods/Qwen3-VL-8B-Instruct-abliterated-v2-GGUF": ("cc4130ded656c7e6300d617bb107eed4dedac152", {
+        "Qwen3-VL-8B-Instruct-abliterated-v2.Q8_0.gguf": "9c381dacf22fe012decb14461585500e017c45b3a046943336c7923b48822a7c",
+        "Qwen3-VL-8B-Instruct-abliterated-v2.f16.gguf": "b13f3ccc42af69d3c373cfbc3c5fa26044d3c03399e9073a30d8bef82536b634",
+        "Qwen3-VL-8B-Instruct-abliterated-v2.mmproj-f16.gguf": "e360d32141265b9956edaed10d0011e02b31a7d847063beac4863a3aaf438b6d",
+    }),
+    "mradermacher/Huihui-Qwen3.5-4B-abliterated-GGUF": ("9d3aebb998fcf084086a3d1c60c31035fcfbf8e1", {
+        "Huihui-Qwen3.5-4B-abliterated.Q8_0.gguf": "1e78f9b48c8b69242fa45bbbbeb439ed818a71381a6362130d62a38561c3756d",
+        "Huihui-Qwen3.5-4B-abliterated.mmproj-f16.gguf": "f14643c11f1e8244c59bca670e2a4c843be4234aa6bb88d0647dae7297798686",
+    }),
+    "mradermacher/Huihui-Qwen3.5-9B-abliterated-GGUF": ("419ca34f424adbd9276c09e0271cb6b718e8da1d", {
+        "Huihui-Qwen3.5-9B-abliterated.Q4_K_M.gguf": "ea1858ef4dc4b648b8dbb44612962a0333e945060dd0545ac0f28d7c4416e4b3",
+        "Huihui-Qwen3.5-9B-abliterated.Q8_0.gguf": "9df7ce00f4df74344dd788ade97c412ef9850e58b44ff337e56fbf07be24a97f",
+        "Huihui-Qwen3.5-9B-abliterated.mmproj-f16.gguf": "56f07ff42fc9ab24fc06a93dce5a48fb2dbe08bff1a1c6e519d50af450820148",
+    }),
+}
 
 
-def _ensure_downloaded(repo_id: str, filename: str, target_dir: str) -> str:
-    """Return the local path for repo_id/filename under target_dir,
-    downloading it first if not already present. Prefers huggingface_hub
-    (resumable, ETag-cached) when importable; falls back to a small
-    hand-rolled resumable downloader rather than adding a hard dependency."""
+def _ensure_downloaded(repo_id: str, filename: str, target_dir: str, label: str = "", size_hint: str = "",
+                       cancel: bool = False, announce: bool = False) -> str:
+    """Return the local path for repo_id/filename under target_dir, downloading it first if not already present
+    (pinned revision, sha256 checked after). Defaults suit the settings button's own thread; a queued run passes
+    cancel=True so Stop cancels it (no half file left), and announce=True for the first-use toast."""
+    from .lc_first_download import download, hf_url
+
     dest_path = os.path.join(target_dir, filename)
     if os.path.exists(dest_path):
         return dest_path
 
+    revision, hashes = PINNED.get(repo_id, ("main", {}))
     print(f"[LC Vision] '{filename}' not found locally -- downloading from {repo_id}...")
-    try:
-        from huggingface_hub import hf_hub_download
-
-        downloaded_path = hf_hub_download(
-            repo_id=repo_id,
-            filename=filename,
-            local_dir=target_dir,
-        )
-        if os.path.abspath(downloaded_path) != os.path.abspath(dest_path) and os.path.exists(downloaded_path):
-            os.replace(downloaded_path, dest_path)
-    except ImportError:
-        url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
-        _download_with_progress(url, dest_path)
+    download(hf_url(repo_id, filename, revision), dest_path, label or filename, size_hint, cancel=cancel, announce=announce)
 
     if not os.path.exists(dest_path):
         raise RuntimeError(f"[LC Vision] Download of '{filename}' from {repo_id} did not produce the expected file.")
+    want = hashes.get(filename)
+    if want:
+        import hashlib
+
+        h = hashlib.sha256()
+        with open(dest_path, "rb") as f:
+            for chunk in iter(lambda: f.read(16 << 20), b""):
+                h.update(chunk)
+        if h.hexdigest() != want:
+            os.remove(dest_path)
+            raise RuntimeError(f"[LC Vision] '{filename}' from {repo_id} doesn't match its known checksum, so it was deleted. "
+                               "Try the download again.")
     print(f"[LC Vision] Finished downloading '{filename}'.")
     return dest_path
 
@@ -399,6 +619,7 @@ def build_llama(params: LCVisionBuildParams) -> tuple[Any, Any]:
     """Construct a fresh (Llama, chat_handler) pair from build params.
     Shared by the Loader's initial load and Caption's rebuild-on-failure
     path, so both go through exactly one code path for this."""
+    linux_cuda_plugin()
     from llama_cpp import Llama
 
     handler_cls = None
@@ -469,7 +690,7 @@ def build_llama(params: LCVisionBuildParams) -> tuple[Any, Any]:
         extra["flash_attn"] = True
     if "type_k" in sig and "type_v" in sig:
         extra["type_k"] = extra["type_v"] = 8  # GGML_TYPE_Q8_0
-    llm = Llama(
+    llm = new_llama(
         model_path=params.model_path,
         chat_handler=chat_handler,
         n_ctx=params.n_ctx,
@@ -629,8 +850,12 @@ class LCVisionLoader:
         keep_model_loaded: bool = True,
     ) -> tuple[LCVisionModel]:
         try:
+            linux_cuda_plugin()
             import llama_cpp  # noqa: F401
         except Exception as exc:
+            hint = llama_missing_hint(exc)
+            if hint:
+                raise RuntimeError(f"[LC Vision] llama_cpp is installed but cannot load. {hint}") from exc
             raise RuntimeError(
                 "[LC Vision] llama_cpp is not installed, or the installed copy cannot load or lacks vision "
                 f"support ({type(exc).__name__}: {exc}). ComfyUI runs on this Python: {sys.executable}  "
@@ -648,8 +873,14 @@ class LCVisionLoader:
                 model_path, mmproj_path = models[local_name]
             else:
                 target_dir = _curated_target_dir()
-                model_path = _ensure_downloaded(entry["repo_id"], entry["model_file"], target_dir)
-                mmproj_path = _ensure_downloaded(entry["repo_id"], entry["mmproj_file"], target_dir)
+                label, size_hint = _download_label(model_name)
+                if not (os.path.exists(os.path.join(target_dir, entry["model_file"]))
+                        and os.path.exists(os.path.join(target_dir, entry["mmproj_file"]))):
+                    from .lc_first_download import toast
+
+                    toast(label, size_hint)  # one toast for the model + mmproj pair
+                model_path = _ensure_downloaded(entry["repo_id"], entry["model_file"], target_dir, label, size_hint, cancel=True)
+                mmproj_path = _ensure_downloaded(entry["repo_id"], entry["mmproj_file"], target_dir, label, size_hint, cancel=True)
                 local_name = next((k for k, v in _discover_vision_models().items()
                                    if os.path.basename(v[0]) == entry["model_file"]), None)
         else:

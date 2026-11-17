@@ -8,6 +8,10 @@ is importable -- installs the matching wheel from JamePeng/llama-cpp-python
 merged upstream -- see README.md for why a plain requirements.txt can
 never resolve this on its own) if one isn't already present.
 
+Pinned: always the same tested release (PINNED_VERSION), only from that fork's GitHub
+Releases, and the wheel's sha256 (GitHub's own digest for the release asset) is checked
+before pip sees it. Nothing here runs at runtime: ComfyUI-Manager runs it at install time.
+
 Safe to re-run on every update: does nothing if a vision-capable llama_cpp
 is already importable. Never touches any other package: the wheel goes in
 with --no-deps, and a numpy/pillow mismatch `pip check` reports afterwards
@@ -28,6 +32,8 @@ README.md instead of installing something that cannot load.
 
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import json
 import platform
 import os
@@ -40,7 +46,9 @@ import urllib.request
 from pathlib import Path
 
 REPO = "JamePeng/llama-cpp-python"
-RELEASES_URL = f"https://api.github.com/repos/{REPO}/releases?per_page=30"
+RELEASES_URL = f"https://api.github.com/repos/{REPO}/releases?per_page=100&page={{page}}"
+PINNED_VERSION = "0.3.49"  # the release LC Vision is tested on (Qwen3-VL and Qwen3.5 handlers)
+DOWNLOAD_PREFIX = f"https://github.com/{REPO}/releases/download/"
 TAG_RE = re.compile(r"^v(?P<version>[\d.]+)-(?P<variant>cu\d+|Metal)-(?P<os>win|linux|macos)-\d+$")
 
 # pip check's "X has requirement Y<spec>, but you have Y <ver>" phrasing
@@ -88,7 +96,9 @@ def _already_vision_capable() -> bool:
         return False
     for handler in ("Qwen3VLChatHandler", "Qwen25VLChatHandler"):
         try:
-            cls = getattr(__import__("llama_cpp.llama_chat_format", fromlist=[handler]), handler)
+            import llama_cpp.llama_chat_format as chat_format
+
+            cls = getattr(chat_format, handler)
         except Exception as exc:
             _last_import_error = f"{type(exc).__name__}: {exc}"
             continue
@@ -189,19 +199,24 @@ def _no_prebuilt_wheel_message(amd: bool) -> None:
 
 
 def _fetch_releases() -> list[dict]:
-    req = urllib.request.Request(
-        RELEASES_URL,
-        headers={"Accept": "application/vnd.github+json", "User-Agent": "LC-Vision-install"},
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.load(resp)
+    """The fork's releases of PINNED_VERSION (paged until found: newer releases come first)."""
+    out = []
+    for page in range(1, 6):
+        req = urllib.request.Request(
+            RELEASES_URL.format(page=page),
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "LC-Vision-install"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            batch = json.load(resp)
+        out += [r for r in batch if r.get("tag_name", "").startswith(f"v{PINNED_VERSION}-")]
+        if not batch or (out and not batch[-1].get("tag_name", "").startswith(f"v{PINNED_VERSION}-")):
+            break
+    return out
 
 
-def _pick_best_asset(releases: list[dict]) -> tuple[str, str] | None:
-    """Returns (download_url, asset_name) for the best-matching wheel, or
-    None if nothing usable was found. Only considers releases tagged with
-    the latest version present -- the releases list is newest-first, so
-    the very first parseable tag fixes what "latest" means for this run."""
+def _pick_best_asset(releases: list[dict]) -> tuple[str, str, str] | None:
+    """Returns (download_url, asset_name, sha256 digest) for the best-matching wheel of PINNED_VERSION, or
+    None if nothing usable was found."""
     os_name = _current_platform_os()
     platform_tag = _current_platform_tag()
     python_tag = _current_python_tag()
@@ -213,7 +228,7 @@ def _pick_best_asset(releases: list[dict]) -> tuple[str, str] | None:
         if not m:
             continue
         if latest_version is None:
-            latest_version = m.group("version")
+            latest_version = PINNED_VERSION
         if m.group("version") != latest_version:
             continue
         if m.group("os") != os_name:
@@ -229,7 +244,7 @@ def _pick_best_asset(releases: list[dict]) -> tuple[str, str] | None:
         _, rel = parsed[0]
         for asset in rel.get("assets", []):
             if f"-{python_tag}-{python_tag}-" in asset["name"] and platform_tag in asset["name"]:
-                return asset["browser_download_url"], asset["name"]
+                return asset["browser_download_url"], asset["name"], asset.get("digest") or ""
         return None
 
     # win/linux: pick the closest CUDA tag to what's actually installed.
@@ -259,7 +274,7 @@ def _pick_best_asset(releases: list[dict]) -> tuple[str, str] | None:
     for asset in rel.get("assets", []):
         name = asset["name"]
         if f"-{python_tag}-{python_tag}-" in name and platform_tag in name:
-            return asset["browser_download_url"], name
+            return asset["browser_download_url"], name, asset.get("digest") or ""
     return None
 
 
@@ -292,8 +307,33 @@ def _clean_uninstall_existing() -> None:
     _run_pip(["uninstall", "-y", "llama-cpp-python", "llama_cpp_python"])
 
 
-def _install_wheel(url: str) -> bool:
-    result = _run_pip(["install", "--no-deps", "--no-cache-dir", url], capture=False)
+def _fetch_checked(url: str, name: str, digest: str) -> Path | None:
+    """Download the wheel to a temp folder and keep it only when its sha256 matches GitHub's digest."""
+    import hashlib
+    import tempfile
+
+    if not url.startswith(DOWNLOAD_PREFIX) or not digest.startswith("sha256:"):
+        _log(f"Refusing {url}: not a {REPO} release download with a sha256 digest.")
+        return None
+    dest = Path(tempfile.mkdtemp(prefix="lc_vision_")) / name
+    _log(f"Downloading {name} ...")
+    h = hashlib.sha256()
+    req = urllib.request.Request(url, headers={"User-Agent": "LC-Vision-install"})
+    with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as out:
+        for chunk in iter(lambda: resp.read(8 << 20), b""):
+            h.update(chunk)
+            out.write(chunk)
+    if h.hexdigest() != digest.split(":", 1)[1].lower():
+        _log("The downloaded wheel doesn't match its sha256 digest: not installing it.")
+        shutil.rmtree(dest.parent, ignore_errors=True)
+        return None
+    _log("sha256 checked.")
+    return dest
+
+
+def _install_wheel(path: Path) -> bool:
+    result = _run_pip(["install", "--no-deps", "--no-cache-dir", str(path)], capture=False)
+    shutil.rmtree(path.parent, ignore_errors=True)
     return result.returncode == 0
 
 
@@ -336,13 +376,100 @@ def _report_measured_conflicts() -> None:
              "and the wheel is checked below by actually importing it.")
 
 
+# llama-cpp-python's own small pure-Python dependencies. The wheel goes in with --no-deps (so pip never
+# touches torch or numpy), which means these have to be added here when they are missing.
+LIGHT_DEPS = {"diskcache": "diskcache>=5.6.1", "jinja2": "jinja2>=2.11.3", "typing_extensions": "typing-extensions>=4.5.0"}
+
+
+def _ensure_light_deps() -> None:
+    missing = [spec for mod, spec in LIGHT_DEPS.items() if importlib.util.find_spec(mod) is None]
+    if not missing:
+        return
+    _log(f"Installing llama-cpp-python's small dependencies: {', '.join(missing)}")
+    _run_pip(["install", "--no-cache-dir"] + missing, capture=False)
+    importlib.invalidate_caches()
+
+
+def _installed_version() -> tuple[int, ...] | None:
+    """llama-cpp-python's version from pip metadata (no import), e.g. (0, 4, 6)."""
+    try:
+        from importlib.metadata import version
+
+        v = version("llama-cpp-python")
+    except Exception:
+        return None
+    return tuple(int(x) for x in re.findall(r"\d+", v.split("+")[0])[:3]) or None
+
+
+def _linux_cuda_check() -> None:
+    """Linux: the wheel's CUDA lives in lib/libggml-cuda.so, which needs CUDA 12 libraries. When the
+    system can't find them llama.cpp quietly runs on CPU, so say so here. LC Vision loads them from the
+    venv's nvidia packages at runtime when a cu12 torch has them."""
+    if not sys.platform.startswith("linux"):
+        return
+    import ctypes
+    import glob
+    import site
+
+    spec = importlib.util.find_spec("llama_cpp")
+    if not spec or not spec.origin:
+        return
+    lib = os.path.join(os.path.dirname(spec.origin), "lib")
+    plugin = os.path.join(lib, "libggml-cuda.so")
+    if not os.path.exists(plugin):
+        return
+
+    def _try() -> str:
+        try:
+            for base in ("libggml-base.so.0", "libggml-base.so"):
+                if os.path.exists(os.path.join(lib, base)):
+                    ctypes.CDLL(os.path.join(lib, base), mode=ctypes.RTLD_GLOBAL)
+                    break
+            ctypes.CDLL(plugin, mode=ctypes.RTLD_GLOBAL)
+            return ""
+        except OSError as exc:
+            return str(exc)
+
+    err = _try()
+    if err:
+        dirs = [p for p in sys.path if p.endswith(("site-packages", "dist-packages"))]
+        try:
+            dirs += site.getsitepackages()
+        except Exception:
+            pass
+        for name in ("libcudart.so.12", "libcublasLt.so.12", "libcublas.so.12", "libnccl.so.2"):
+            for d in dict.fromkeys(dirs):
+                hits = glob.glob(os.path.join(d, "nvidia", "*", "lib", name))
+                if hits:
+                    try:
+                        ctypes.CDLL(hits[0], mode=ctypes.RTLD_GLOBAL)
+                    except OSError:
+                        pass
+                    break
+        if not _try():
+            _log("CUDA plugin loads with the CUDA 12 libraries from this venv. LC Vision loads them the same way.")
+            return
+        _log(f"WARNING: llama-cpp's CUDA plugin cannot load ({err}). LC Vision would run on CPU.")
+        _log("Install the CUDA 12 runtime libraries, or build llama-cpp-python against your own CUDA:")
+        _log(f'  CMAKE_ARGS="-DGGML_CUDA=on" "{sys.executable}" -m pip install "llama-cpp-python @ git+https://github.com/{REPO}.git"')
+        return
+    _log("CUDA plugin loads: LC Vision runs on the GPU.")
+
+
 def main() -> int:
+    _ensure_light_deps()
     if _already_vision_capable():
         _log("A vision-capable llama_cpp (Qwen3VLChatHandler or Qwen25VLChatHandler) is already installed. Nothing to do.")
+        _linux_cuda_check()
         return 0
 
     if _last_import_error:
         _log(f"llama_cpp is present but not usable: {_last_import_error}")
+    have = _installed_version()
+    if have and have >= (0, 4):
+        # a newer fork build (often compiled from source for this machine's CUDA): never replace it
+        _log(f"llama-cpp-python {'.'.join(map(str, have))} is newer than the tested {PINNED_VERSION}. Leaving it as it is.")
+        return 0
 
     if _current_platform_os() != "macos" and _detected_cuda_version() is None:
         amd = _is_amd_torch()
@@ -363,16 +490,23 @@ def main() -> int:
     if not picked:
         _log(
             f"No matching wheel found for {_current_python_tag()} / {_current_platform_tag()} in the "
-            f"latest {REPO} release. See README.md to install manually (or compile from source with "
+            f"{REPO} release v{PINNED_VERSION}. See README.md to install manually (or compile from source with "
             "-DLLAMA_CPP_PYTHON_VISION=on)."
         )
         return 1
 
-    url, name = picked
+    url, name, digest = picked
     _log(f"Selected wheel: {name}")
+    try:
+        wheel = _fetch_checked(url, name, digest)
+    except Exception as exc:
+        _log(f"Could not download the wheel ({exc}). See README.md to install manually.")
+        return 1
+    if wheel is None:
+        return 1
 
     _clean_uninstall_existing()
-    if not _install_wheel(url):
+    if not _install_wheel(wheel):
         _log("pip install failed -- see the output above. See README.md to install manually.")
         return 1
 
@@ -380,6 +514,7 @@ def main() -> int:
 
     if _already_vision_capable():
         _log("Install verified -- Qwen3VLChatHandler/Qwen25VLChatHandler is now importable.")
+        _linux_cuda_check()
         return 0
 
     _log("Installed the wheel, but it still doesn't expose a vision chat handler -- something's off. See README.md.")
