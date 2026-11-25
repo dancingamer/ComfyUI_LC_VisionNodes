@@ -244,7 +244,8 @@ def build_prompt(kind: str, name: str, d: dict, family: str = "Krea 2", style: s
     for c in people:  # the image model doesn't know the names: each one becomes their look, once
         action = re.sub(rf"\b{re.escape(c['name'])}\b", f"the {c.get('who') or 'person'} ({c.get('look', '').strip()})", action, count=1)
         action = re.sub(rf"\b{re.escape(c['name'])}\b", f"the {c.get('who') or 'person'}", action)
-    return _sentences(f"A wide film still at {name}. {where}. {action}.{extra} Cinematic framing, eye level. {suffix}")
+    # camera words lead: at the end they turn into a camera someone holds (prompt order bench, 2026-11-22)
+    return _sentences(f"A wide film still at {name}, eye level, cinematic framing. {where}. {action}.{extra} {suffix}")
 
 
 def _size(kind: str, family: str, portrait: int, wide_w: int, wide_h: int) -> tuple:
@@ -268,7 +269,7 @@ class LCVisionStoryboardBuilder:
                 "portrait_size": ("INT", {"default": 1024, "min": 512, "max": 2048, "step": 16, "tooltip": "Square size of the cast portraits."}),
                 "landscape_width": ("INT", {"default": 1344, "min": 512, "max": 2560, "step": 16, "tooltip": "Width of the place pictures and anchors. 1344 x 768 matches the movie's 960 x 544 shape."}),
                 "landscape_height": ("INT", {"default": 768, "min": 512, "max": 2048, "step": 16, "tooltip": "Height of the place pictures and anchors."}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "tooltip": "Each picture's seed comes from this plus its name, so a redo of one picture keeps the others."}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True, "tooltip": "Each picture's seed comes from this plus its name, so a redo of one picture keeps the others."}),
             },
             "optional": {
                 "only": ("STRING", {"default": "", "tooltip": "Optional. Names to make (again), comma separated, like: Earl, the bank lobby. Blank = everything make and the switches allow."}),
@@ -284,6 +285,7 @@ class LCVisionStoryboardBuilder:
     OUTPUT_IS_LIST = (True, True, True, True, False)
     FUNCTION = "build"
     CATEGORY = "LC Vision/movie"
+    DEPRECATED = True  # replaced by LC H3 Story (LC AV): hidden from search, saved workflows still load and run
     DESCRIPTION = ("Pictures for a Showrunner movie: finds what the project is missing (faces, places, anchors) and "
                    "makes one prompt, latent and seed per picture for the sampler. Feed LC Vision Storyboard Save.")
 
@@ -389,6 +391,7 @@ class LCVisionStoryboardSave:
     OUTPUT_NODE = True
     FUNCTION = "save"
     CATEGORY = "LC Vision/movie"
+    DEPRECATED = True  # replaced by LC H3 Story (LC AV): hidden from search, saved workflows still load and run
     DESCRIPTION = ("Saves the Storyboard Builder's pictures to input/lc_h3_refs/<project>/ and lists them in the "
                    "project. 📂 Load on the Showrunner adds them to the Reference Assembler.")
 
@@ -451,6 +454,7 @@ class LCVisionStoryboardSheet:
     RETURN_TYPES = ()
     FUNCTION = "noop"
     CATEGORY = "LC Vision/movie"
+    DEPRECATED = True  # replaced by LC H3 Story (LC AV): hidden from search, saved workflows still load and run
     DESCRIPTION = ("The storyboard on the node: a card for every picture the movie can use (faces, places, anchors). ✅ Use "
                    "puts one in the Reference Assembler, ↻ makes it again, ✎ changes its prompt. Nothing to wire: it follows "
                    "the Showrunner's project.")
@@ -498,6 +502,6 @@ _routes()
 
 NODE_CLASS_MAPPINGS = {"LCVisionStoryboardBuilder": LCVisionStoryboardBuilder, "LCVisionStoryboardSave": LCVisionStoryboardSave,
                        "LCVisionStoryboardSheet": LCVisionStoryboardSheet}
-NODE_DISPLAY_NAME_MAPPINGS = {"LCVisionStoryboardBuilder": "LC Vision Storyboard Builder (BETA) 🎞️",
-                              "LCVisionStoryboardSave": "LC Vision Storyboard Save (BETA) 🎞️",
-                              "LCVisionStoryboardSheet": "LC Vision Storyboard Sheet (BETA) 🎞️"}
+NODE_DISPLAY_NAME_MAPPINGS = {"LCVisionStoryboardBuilder": "LC Vision Storyboard Builder (deprecated) 🎞️",
+                              "LCVisionStoryboardSave": "LC Vision Storyboard Save (deprecated) 🎞️",
+                              "LCVisionStoryboardSheet": "LC Vision Storyboard Sheet (deprecated) 🎞️"}

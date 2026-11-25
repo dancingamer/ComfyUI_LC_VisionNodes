@@ -21,6 +21,7 @@ import io
 import numpy as np
 from PIL import Image
 
+from .lc_vision_filter import filter_note, vision_filter
 from .lc_vision_generate import budget_line, generate_with_recovery, release, trim_to_sentence
 from .lc_vision_loader import LCVisionModel, MODEL_TYPE, strip_thinking
 from .lc_vision_styles import STYLE_TAG_OPTIONS, apply_style_tag_to_content
@@ -30,16 +31,18 @@ NODE_DISPLAY_NAME = "LC Vision Caption 📝"
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful vision assistant. Describe what you are shown in rich, concrete "
-    "detail rather than a brief summary: subject appearance, pose and expression, "
-    "clothing, setting and background, lighting, color palette, composition and camera "
-    "angle, and overall mood. Do not skip detail for the sake of brevity. Respond with "
-    "the final answer only -- no reasoning, no <think> blocks."
+    "detail rather than a brief summary, in this order: the camera angle and framing, "
+    "the lighting and color palette, the setting and background, the subject's appearance "
+    "and clothing, the expression, the pose, and the overall mood. Write the pose as body "
+    "mechanics: where the weight sits, which way the hips and shoulders turn, the head and "
+    "chin, where each hand is, and the feet. Do not skip detail for the sake of brevity. "
+    "Respond with the final answer only -- no reasoning, no <think> blocks."
 )
 
 DEFAULT_PROMPT = (
-    "Describe this image in detail: the subject's appearance, pose, and expression, "
-    "their clothing, the setting and background, lighting and color palette, "
-    "composition, and overall mood."
+    "Describe this image in detail, in this order: the camera angle and framing, the "
+    "lighting and color palette, the setting and background, the subject's appearance "
+    "and clothing, their expression, their pose, and the overall mood."
 )
 
 
@@ -169,6 +172,8 @@ class LCVisionCaption:
                     content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{all_frames[i]}"}})
 
         content = apply_style_tag_to_content(content, style_tag)
+        if filter_note(vision_model):  # LC Vision Filter: said last so it beats the request
+            content.append({"type": "text", "text": filter_note(vision_model)})
 
         effective_user_content = content
         if getattr(vision_model, "is_qwen3_family", False):
@@ -180,7 +185,7 @@ class LCVisionCaption:
             effective_user_content = [{"type": "text", "text": "/no_think"}] + content
 
         messages = [
-            {"role": "system", "content": (system_prompt or "") + budget_line(max_tokens)},
+            {"role": "system", "content": (system_prompt or "") + vision_filter(vision_model) + budget_line(max_tokens)},
             {"role": "user", "content": effective_user_content},
         ]
 

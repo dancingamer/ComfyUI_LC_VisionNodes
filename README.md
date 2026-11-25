@@ -59,7 +59,7 @@ Custom nodes for [ComfyUI](https://github.com/comfyanonymous/ComfyUI) by [loneca
 - **CivitAI:** [lonecatone23](https://civitai.com/user/lonecatone23)
 - **Instagram:** [synth.studio.models](https://www.instagram.com/synth.studio.models/)
 - **Support:** [Buy me a ☕](https://ko-fi.com/lonecatone)
-- **Version:** 1.6.31 · **12 nodes** + the **Vision Assistant** sidebar
+- **Version:** 1.6.42 · **9 nodes** + the **Vision Assistant** sidebar
 
 > Local Qwen-VL vision tools built to survive a real ComfyUI session: model stays loaded, several references in one call, and it heals itself when the upstream backend's own decode bug fires.
 
@@ -178,7 +178,8 @@ None of that gets fixed by updating a GPU driver. It needs an installer that res
 Loads a Qwen-VL GGUF model + its mmproj vision handler once, then hands a persistent handle downstream. ComfyUI's own node caching keeps it resident across queues as long as its inputs don't change.
 
 - **Model discovery:** scans every path registered under the `LLM` folder key (`models/LLM/GGUF` by default), pairs each model `.gguf` with an mmproj `.gguf` in the same folder. Only lists pairs that actually have both.
-- **Auto-download on first use:** the dropdown also lists a small curated set of `Download:` entries (Qwen3-VL 4B and 8B, each abliterated, each at `Q8_0` or `f16`) that aren't downloaded yet. Picking one pulls it, and its `mmproj-f16`, straight from HuggingFace into the same folder discovery already scans. `Q8_0` for low-VRAM or new setups, `f16` for well-equipped machines and cloud rigs. An entry drops off the list once it's actually on disk.
+- **Auto-download on first use:** the dropdown also lists a small curated set of `Download:` entries (Qwen3-VL 4B and 8B and Qwen3.5 4B and 9B, all abliterated, at `Q4_K_M`, `Q8_0` or `f16`) that aren't downloaded yet. Picking one pulls it, and its `mmproj-f16`, straight from HuggingFace into the same folder discovery already scans. `Q4_K_M` for 8 GB cards, `Q8_0` for most setups, `f16` for well-equipped machines and cloud rigs. An entry drops off the list once it's actually on disk.
+- **Missing mmproj:** a model needs its mmproj in the same folder. A workflow saved with one of the download models by file name fetches whatever is missing (just the mmproj, next to the model, when the model is already there). Any other model without its mmproj gets an error that says so.
     - After the download, the node switches itself to the real file name, so the next run just works.
     - **Qwen3.5 VL** (4B Q8, 9B Q4_K_M, 9B Q8) is in the list too. Qwen3-VL stays the ★ pick: in my tests Qwen3.5 was slower and guessed more.
     - Or download from **LC Settings ⚙️ > Vision > Vision models**.
@@ -198,6 +199,7 @@ Loads a Qwen-VL GGUF model + its mmproj vision handler once, then hands a persis
 
 Handle + prompt + references → text.
 
+- The default instruction describes a picture in the shared prompt order (camera, light, place, person, expression, pose, mood), so a caption pastes straight into a prompt.
 - **Up to three independent reference images plus a separate reference video**, each labeled distinctly (`<Reference 1>`, `<Reference 2>`, `<Target Video>`) instead of merged into one batch. That's the actual gap in the upstream node this pack exists to close.
 - **`max_image_side`** downscales references before sending. Oversized references were the direct cause of the original node's "exceeding capacity" crashes, keep it in proportion with the Loader's `n_batch`.
 - **`max_tokens`** is a length limit the model actually follows: it's told to fit under it and end on a whole sentence. If it still runs over, the text is cut back to the last complete sentence, so a low limit gives a shorter caption, never a chopped one. Same for Prompt Enhancer.
@@ -206,9 +208,12 @@ Handle + prompt + references → text.
 
 ## LC Vision Reviewer 🕵️ (BETA)
 
-A quality gate for finished renders. Asks the vision model yes/no questions and passes the image on with **passed** and a **report**.
+A quality gate for finished renders. Asks the vision model yes/no questions and passes the image on with **passed**, a **report** and a short **note**.
 
 - Checks: **hands**, **faces**, **text** (signs spelled right), **artifacts**, plus a **prompt** match when you wire the positive prompt in.
+- **presence**: the anti-mannequin check. The body is supported (weight on a leg, a seat or wall actually holding it, no floating feet or props) and there is only one of the person (no clone, no inset picture).
+- **prompt** is information, never a miss: an off picture still passes and shows **· prompt ⚠️** on the note.
+- **note**: one line per picture, e.g. **QC ✅ 5/5** or **QC ❌ 4/5: hands**. Wire it into **LC Preview Gate**'s `note` (LC123) to see it on every thumbnail. A ❌ gets a red ✕ in the corner, nothing is dropped for you.
 - **custom_checks**: your own, one per line, written so yes = good (e.g. Is she wearing a parka?).
 - **on_fail**: **flag** (default) always passes the image on. **block** stops everything wired after it (the save, the upscaler, etc.).
 - A batch of more than 4 frames is read as a video: a few frames across the clip are checked together.
@@ -216,18 +221,50 @@ A quality gate for finished renders. Asks the vision model yes/no questions and 
 
 ## LC Vision Prompt Enhancer 📝
 
-Text-only rewrite pass over the same model handle. A vision model is still a perfectly good text-only LLM when nothing gets attached to the message.
+Rewrite pass over the same model handle. Text only unless you wire a picture into **image_1** / **image_2**: a vision model is still a perfectly good text-only LLM.
 
-- **Presets live in `lc_vision_presets.json`**, not code. Ships with four original presets (`Enhance`, `Refine`, `Creative Rewrite`, `Detailed Visual`), `Character Anchor`, and four for **Flux 3 Klein**.
+- **Presets live in `lc_vision_presets.json`**, not code. Ships with four original presets (`Enhance`, `Refine`, `Creative Rewrite`, `Detailed Visual`), `Pose from Picture`, `Character Anchor`, and four for **Flux 3 Klein**.
 - **Flux 3 presets:** `Flux 3 Text to Image`, `Flux 3 Edit`, `Flux 3 Layout (boxes)` and `Flux 3 Edit (boxes)` are Black Forest Labs' own prompt upsampler instructions, unchanged. The edit presets need the picture you edit in **image_1**.
 - **image_1 / image_2:** optional pictures the model sees while it rewrites.
 - **`Custom` preset** sits at the top of the dropdown. Reads the system prompt straight from the `custom_system_prompt` socket instead of the JSON file, for full per-workflow control. A new node starts on `Enhance`, and an empty `custom_system_prompt` falls back to `Enhance` instead of erroring.
 - **`Character Anchor` preset** for character datasets: give it the reference picture(s) and a few notes ("blonde hair, fit") and it writes one short description of the person only (face, eyes, hair, skin, build). Never the clothing, pose, background or light, so every prompt in a list can set those. Its inputs don't change between rows, so it runs once per list.
+- **`Pose from Picture` preset:** a reference picture in **image_1**, and it writes two sentences: where the camera stands, then the pose as body mechanics (weight, hips, shoulders, head, each hand, feet). Nothing about who she is, what she wears or where she is, so it drops into any prompt.
+    - 💡 Camera sentence goes at the front of your prompt, the pose near the end.
 - **`style_tag`**, same shared list as Caption.
 - **MOSS BBOX:** base prompt into LC MOSS Layout Prompt's prompt box, its output into `prompt_text`. The output stays a layout: the scene and every box are enhanced on their own, box names and positions kept. Box captions stay short (about 60 tokens): longer, the subjects outgrow their boxes. Bypass the Layout Prompt and the base prompt comes through as a normal prompt. No base prompt: the scene stays empty and the model picks the setting.
 - **✨ boxes in LC Bounding Boxes (LC123):** an idea row on the box editor. With a picture, the vision model finds the subjects and writes their boxes, descriptions and palettes (Qwen3-VL 8B is the default: its own box grid is the editor's); without one, it plans the boxes from the idea. Signs with words become text boxes. Runs outside the queue, never during a render, and unloads when done.
 - **🌐 360 from card in LC H3 Story (LC_AV):** the vision model reads a place's room picture and writes the whole place out, all the way round, for the Story's ✨ 360 to draw from. Same model choice as ✨ boxes; it loads for the one answer and unloads.
 - **Think-leak retry:** if the output looks like leftover planning text instead of the actual rewritten prompt, one retry asks explicitly for just the final text.
+
+## LC Vision Smart Prompt Batch 🎓
+
+A wildcard processor with a brain. One base prompt, pick what changes, and it writes a whole batch of new prompts.
+
+- **vary:** what changes, from the 🎯 **What changes** list or typed (Location, Time of day, Hair color, Outfit, Pose, Camera angle, etc.). Everything you didn't pick stays word for word.
+- Details tied to the old version adapt with it: change the place and the railing, the string lights and the skyline go too.
+- Her face, hair and clothes stay word for word unless you pick them: a new place never changes her eye color or the fur on her hood.
+- A part the base never mentions gets added where it belongs: a camera angle at the front, a pose or expression near the end. New poses are written as body mechanics.
+- **count:** prompts per run, one picture each. New seed = new batch, same seed = same batch.
+- **variation:** how much each new part gets to say. 60 is a quick swap, 150 and up a rich new description.
+- **enhance_base / style_tag / max_tokens:** rewrite the base once (more detail, a style, a length) and keep it through every seed. 🗑 **Clear kept base** starts over.
+- **removed** shows what changed: `[brackets]` = the picked parts, `{braces}` = the details that adapt. **prompt_list** is the whole batch as one text.
+- 💡 Starting from a picture: caption it first (with **LC Vision Filter** for only the parts you want), then paste it in.
+
+## LC Vision Filter 🧹
+
+Sits between **LC Vision Loader** and **Caption** / **Prompt Enhancer** and decides what they write about.
+
+- **describe:** only these parts get written (Person, Outfit, Pose, etc.). **leave_out:** these never do (Location, Background, etc.). Both have a ✓ list.
+- Each part takes in what belongs to it: Location also drops the railings, lights and signs.
+- Several parts in **describe** get written in the shared prompt order (camera first, pose near the end). **Pose** is written as body mechanics.
+- 💡 Caption **Person, Outfit** only, then vary **Location** in Smart Prompt Batch: no old place left to clash with the new one.
+
+## LC Image with Prompt 🖼️
+
+A preview that keeps each picture's prompt. Takes a whole Smart Prompt Batch run.
+
+- Double-click the node (or 🔍 **View with prompt**): the prompt sits next to the picture. Click it to copy.
+- Arrows step through the batch, Esc closes.
 
 ## LC Vision Danbooru Caption 🏷️
 
@@ -259,57 +296,14 @@ Plans a video as N independently-generated segments in **one** LLM call, not N c
 
 ---
 
-## LC Vision Showrunner (BETA) 🎬
+## Deprecated: the old Showrunner nodes 🗄️
 
-Moviemaker's big brother for long videos: it plans a chain of short segments that pick up from each other. Its **plan** goes into **LC H3 Make** in [LC AV](https://github.com/lonecatone23/ComfyUI_LC_AV_nodes), which renders and joins them. (LC H3 Story in LC AV is the hand-written way to the same plan.)
+**LC H3 Story** in [LC AV](https://github.com/lonecatone23/ComfyUI_LC_AV_nodes) replaced these. They are hidden from the node search; a saved workflow that uses them still opens and runs.
 
-- **One style block for every segment.** Who's in it, where, the light and the camera are written once and pasted word for word into every segment, so nothing gets reworded halfway through.
-- **One continuous take.** Every segment continues from the last 1.6 s of the one before (`overlap_seconds`), so its new action is planned on the time that's left. A **CUT** only happens where your story writes one ("cut to..."). Walking into a new place happens inside the take.
-- **Ends settled.** Each segment ends on a calm pose with the face visible, so the next one has a clean handoff. A line of dialogue never gets split across two segments, and the story's own lines are checked for.
-- **Projects.** 💾 **Save** (and every Run) writes the Shot List, the Reference Assembler's list and the settings to `output/LC_H3/<project>/project.json`. 📂 **Load** brings one back; the Reference Assembler keeps its own pictures when it already has some.
-- **Plans once.** The plan saves to `output/LC_H3/<project>/plan.json` and reloads in about 2 s without loading the model, until you change the story or the timing, or turn on **replan**.
-- **Staging and props.** The camera leads the main person so the face stays visible, and anything that comes back (the cup, the bag) is described once and repeated word for word, so it doesn't change between segments.
-- **Fixes the joins.** Before each CONTINUE segment it looks at how the one before **really** ended and rewrites the start to match. Most jumps at a join come from the plan saying "she opens the door" when the door is already open, and H3 snaps the pose to match the words. Timestamps and spoken lines are protected: a rewrite that loses either is thrown out.
-- **extend_segments** (on): a shot with a long line gets its own longer segment, up to 10 s, instead of a warning to shorten it. Off: every segment is `segment_seconds` long.
-- 💡 **`segment_seconds`** 5 is a good default. Shorter segments = less VRAM. The first segment is 5 s and each CONTINUE adds about 3.5 s, so about 16 segments make a minute.
-
----
-
-## LC Vision Shot List (BETA) 📋
-
-The story for the Showrunner, filled in like a form instead of written from scratch. No AI involved.
-
-- **The place**, **the cast** (name, man / woman, look) and **one row per shot**: framing, camera move, action, who speaks and the line.
-- It writes the story the way the Showrunner reads it best: the place, the cast by name, "Cut to ..." for every new shot and at most one short line per shot.
-- **segments:** a suggested segment count: one per shot. A long line gets a longer segment from the Showrunner's **extend_segments**. Plug it into the Showrunner's segments.
-- 🧹 **Clear** empties the whole list for a new project (click twice). The Reference Assembler is never cleared.
-- **warnings:** what to fix, like a line too long for its shot or a speaker who is not in the cast. Empty when it all looks good.
-
----
-
-## LC Vision Storyboard (BETA) 🎞️
-
-Reference pictures for a Showrunner movie, made with an image model in a separate workflow. Nothing here is required: a movie runs without it.
-
-**LC Vision Storyboard Builder**
-- Reads the project and lists what is missing: a **face** for each cast member, a **place** picture for each place, and an **anchor** (the opening wide shot of a place with several people, holding who stands where).
-- One prompt, empty latent and seed per picture, so the sampler makes them all in one queue.
-- **base_model:** Krea 2 (Z-Image is set up for when its workflow exists).
-- **make:** **missing only**, or **everything** again. Your own pictures are never replaced.
-- **only:** names to make again, like `Earl, the bank lobby`. Each picture's seed comes from **seed** plus its name, so a redo of one keeps the others.
-- 1344 x 768 landscapes match the movie's 960 x 544 shape.
-
-**LC Vision Storyboard Save**
-- Writes the pictures to `input/lc_h3_refs/<project>/` and adds them to the project. 📂 **Load** on the Showrunner puts them in the Reference Assembler.
-
-**LC Vision Storyboard Sheet**
-- A card for every picture the movie can use, right on the node: ✅ **Use** puts it in the Reference Assembler, ↻ makes it again, ✎ changes its prompt. Nothing to wire.
-
----
-
-## LC Vision Redirect (BETA) 🔬
-
-The Showrunner does this itself now. Kept so older workflows still open; it passes the plan straight through when the Showrunner already fixed the join.
+- **LC Vision Showrunner (deprecated) 🎬**
+- **LC Vision Shot List (deprecated) 📋**
+- **LC Vision Storyboard Builder / Save / Sheet (deprecated) 🎞️**
+- **LC Vision Redirect (deprecated) 🔬**
 
 ---
 
@@ -378,11 +372,15 @@ A sidebar tab (the LC logo on the left) that reads the open workflow for you. Wo
 - Seeing `[LC Vision] Decode failed on a reused model instance...; rebuilding and retrying once.` in the console is **expected, not a bug**. That's the self-heal catching the upstream decode bug and recovering on its own. Only flag it if the retry fails too.
 - 4B suits Moviemaker and video workloads (more memory headroom for multi-frame batches). 8B suits Caption and image fidelity.
 - ✋ Moviemaker's `[Shot N]` label identifies which reference a moment involves. It is not a cut instruction. Ask it for one continuous take per segment if you see it start cross-cutting.
+- 💡 **Prompt order:** Caption, Filter, Smart Prompt Batch and the Enhancer presets all write in one order: **camera, light, place, person + outfit, expression, pose, mood**, style words last. The room first, then the person.
+    - Camera words at the end turn into a camera she's holding (benched on Krea 2). A pose written early drifts.
+    - Beyond that the exact order barely matters. Keeping it the same every time is what lets the Filter find each part.
 
 ## Example workflows
 
 In `workflows/`:
 - **LC Vision LLM Modules**: Caption, Prompt Enhancer, Moviemaker and Reviewer, wired up and ready. Drop your own model and references in.
+- **LC Vision Smart Prompt Batch**: picture or prompt in, a batch of variations out (Filter, Caption, Smart Prompt Batch, Image with Prompt), with a guided tour.
 
 ## Licensing note
 
